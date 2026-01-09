@@ -1,6 +1,6 @@
 import os
 import io
-from datetime import date, timedelta
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -27,6 +27,7 @@ if not SUPABASE_URL:
     st.error("Missing SUPABASE_URL in Streamlit secrets.")
     st.stop()
 
+# Prefer service role key to avoid RLS/policy errors
 SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY_FALLBACK
 if not SUPABASE_KEY:
     st.error("Missing SUPABASE_SERVICE_ROLE_KEY (recommended) or SUPABASE_KEY in secrets.")
@@ -38,7 +39,7 @@ PLACE_TYPE_NEW = "✍️ Type a new place..."
 
 
 # =========================
-# ERROR DISPLAY
+# DEBUG / ERROR DISPLAY
 # =========================
 def show_api_error(e: Exception):
     st.error("Database request failed.")
@@ -231,10 +232,10 @@ def month_range(d: date):
     return start, last_day
 
 
-def make_export_df_from_raw(df_raw: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
-    if df_raw.empty:
-        return df_raw
-    out = df_raw.copy()
+def make_export_df(df: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
     out["Car"] = out["car_id"].map(car_id_to_label).fillna("")
     out = out.rename(columns={
         "trip_date": "Date",
@@ -264,9 +265,10 @@ def export_xlsx_bytes(df: pd.DataFrame) -> bytes:
 def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     buff = io.BytesIO()
     c = canvas.Canvas(buff, pagesize=A4)
+    w, h = A4
 
     x = 40
-    y = A4[1] - 50
+    y = h - 50
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, title)
 
@@ -297,7 +299,7 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     for _, row in df.iterrows():
         if y < 60:
             c.showPage()
-            y = A4[1] - 50
+            y = h - 50
             c.setFont("Helvetica", 9)
 
         xx = x
@@ -313,68 +315,11 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     return buff.getvalue()
 
 
-def build_grouped_editor_df(df_trips: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
-    if df_trips.empty:
-        return df_trips
-
-    d = df_trips.copy()
-    d["trip_date"] = pd.to_datetime(d["trip_date"], errors="coerce").dt.date
-    d["distance_km"] = pd.to_numeric(d["distance_km"], errors="coerce").fillna(0.0).astype(float)
-    d["notes"] = d["notes"].fillna("").astype(str)
-    d["departure"] = d["departure"].fillna("").astype(str)
-    d["arrival"] = d["arrival"].fillna("").astype(str)
-    d["car_label"] = d["car_id"].map(car_id_to_label).fillna("")
-
-    if "created_at" in d.columns:
-        d = d.sort_values(["trip_date", "created_at"], ascending=[True, True])
-    else:
-        d = d.sort_values(["trip_date"], ascending=[True])
-
-    rows = []
-    for trip_date_val, chunk in d.groupby("trip_date", sort=True):
-        rows.append({
-            "RowType": "DATE",
-            "Delete?": False,
-            "Date": trip_date_val,
-            "Car": "",
-            "Departure": f"—— {trip_date_val.isoformat()} ({trip_date_val.strftime('%A')}) ——",
-            "Arrival": "",
-            "Distance (km)": 0.0,
-            "Notes": "",
-            "ID": "",
-        })
-
-        for _, r in chunk.iterrows():
-            rows.append({
-                "RowType": "TRIP",
-                "Delete?": False,
-                "Date": r["trip_date"],
-                "Car": r["car_label"],
-                "Departure": r["departure"],
-                "Arrival": r["arrival"],
-                "Distance (km)": float(r["distance_km"]),
-                "Notes": r["notes"],
-                "ID": str(r["id"]),
-            })
-
-    out = pd.DataFrame(rows)
-    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
-    out["Distance (km)"] = pd.to_numeric(out["Distance (km)"], errors="coerce").fillna(0.0).astype(float)
-    for col in ["Car", "Departure", "Arrival", "Notes", "ID", "RowType"]:
-        out[col] = out[col].fillna("").astype(str)
-
-    return out
-
-
 # =========================
 # SESSION STATE
 # =========================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-
-# This is the “current working date” for Add Trip + Skip
-if "entry_date" not in st.session_state:
-    st.session_state.entry_date = date.today()
 
 
 # =========================
@@ -406,6 +351,7 @@ with tabs[0]:
 
     # Period selection
     st.subheader("Period (logbook)")
+
     periods = get_periods()
     if not periods:
         create_period("Default")
@@ -445,30 +391,15 @@ with tabs[0]:
     # Places
     places = get_places()
 
-    # Add trip + Skip date + weekday display
+    # Add trip
     st.subheader("Add a trip")
-
     with st.container(border=True):
-        # show weekday for current entry_date
-        weekday = st.session_state.entry_date.strftime("%A")
-        st.caption(f"Selected date: **{st.session_state.entry_date.isoformat()}** ({weekday})")
-
-        # allow manual change too
-        st.session_state.entry_date = st.date_input(
-            "Date",
-            value=st.session_state.entry_date,
-            key="entry_date_input"
-        )
-
-        colA, colB = st.columns([2, 1])
-        with colA:
+        col1, col2 = st.columns(2)
+        with col1:
+            trip_date = st.date_input("Date", value=date.today())
+        with col2:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
-        with colB:
-            # Skip date button
-            if st.button("⏭️ Skip date", use_container_width=True):
-                st.session_state.entry_date = st.session_state.entry_date + timedelta(days=1)
-                st.rerun()
 
         departure = place_picker("Departure", places, "dep")
         arrival = place_picker("Arrival", places, "arr")
@@ -483,171 +414,180 @@ with tabs[0]:
             if not departure or not arrival:
                 st.error("Please fill in Departure and Arrival.")
             else:
-                insert_trip(selected_period_id, st.session_state.entry_date, car_id, departure, arrival, distance, notes)
+                insert_trip(selected_period_id, trip_date, car_id, departure, arrival, distance, notes)
                 upsert_place(departure)
                 upsert_place(arrival)
-
-                # Progress date after saving
-                st.session_state.entry_date = st.session_state.entry_date + timedelta(days=1)
-
-                st.success("Saved! Moving to next day.")
+                st.success("Saved!")
                 st.rerun()
 
     st.divider()
 
-    # Simple range + table (kept from polished version)
-    colr1, colr2 = st.columns([1, 2])
-    with colr1:
-        range_mode = st.radio("Range", ["This month", "Custom"], horizontal=False)
-    with colr2:
-        if range_mode == "This month":
-            pick = st.date_input("Month", value=date.today())
-            start_date, end_date = month_range(pick)
-        else:
-            cA, cB = st.columns(2)
-            with cA:
-                start_date = st.date_input("Start", value=date(date.today().year, 1, 1))
-            with cB:
-                end_date = st.date_input("End", value=date.today())
+    # Filters
+    st.subheader("Filters")
+    mode = st.radio("Range", ["This month", "Custom range"], horizontal=True)
+    if mode == "This month":
+        pick = st.date_input("Pick any day in the month", value=date.today())
+        start_date, end_date = month_range(pick)
+    else:
+        cA, cB = st.columns(2)
+        with cA:
+            start_date = st.date_input("Start date", value=date(date.today().year, 1, 1))
+        with cB:
+            end_date = st.date_input("End date", value=date.today())
 
-    colf1, colf2 = st.columns(2)
-    with colf1:
-        filter_car = st.selectbox("Car", ["All cars"] + car_labels)
-    with colf2:
-        search_text = st.text_input("Search", placeholder="type to search...")
+    f1, f2 = st.columns(2)
+    with f1:
+        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
+    with f2:
+        search_text = st.text_input("Search (departure/arrival/notes)", placeholder="type to filter...")
 
     filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
 
     df = fetch_entries(selected_period_id, start_date, end_date, car_id=filter_car_id, search_text=search_text)
 
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
-    st.metric("Total distance", f"{total_km:.1f} km")
+    st.metric("Total distance (selected)", f"{total_km:.1f} km")
 
-    st.subheader("Trips")
-    if df.empty:
-        st.info("No trips found for this range.")
+    df_export = make_export_df(df, car_id_to_label)
+
+    st.write("### Trips")
+    if df_export.empty:
+        st.info("No trips found.")
     else:
-        grouped_editor_df = build_grouped_editor_df(df, car_id_to_label)
+        st.dataframe(df_export, use_container_width=True, hide_index=True)
+
+    # Export
+    st.write("### Export")
+    csv_bytes = export_csv_bytes(df_export)
+    xlsx_bytes = export_xlsx_bytes(df_export)
+    pdf_bytes = export_pdf_bytes(
+        df_export,
+        title=f"Trip Logbook — {selected_period_name} ({start_date} to {end_date})",
+        total_km=total_km
+    )
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.download_button(
+            "⬇️ CSV",
+            data=csv_bytes,
+            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+    with e2:
+        st.download_button(
+            "⬇️ XLSX",
+            data=xlsx_bytes,
+            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+    with e3:
+        st.download_button(
+            "⬇️ PDF",
+            data=pdf_bytes,
+            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.divider()
+
+    # Manage trips (FIXED st.data_editor types)
+    st.subheader("Manage trips (edit / delete)")
+
+    if df.empty:
+        st.info("Nothing to manage for this selection.")
+    else:
+        manage_df = df.copy()
+
+        # Convert trip_date to actual date objects (required for DateColumn)
+        manage_df["trip_date"] = pd.to_datetime(manage_df["trip_date"], errors="coerce").dt.date
+
+        # Convert distance to float (required for NumberColumn stability)
+        manage_df["distance_km"] = pd.to_numeric(manage_df["distance_km"], errors="coerce").fillna(0.0).astype(float)
+
+        manage_df["car_label"] = manage_df["car_id"].map(car_id_to_label).fillna("")
+        manage_df["DELETE"] = False
+
+        # Keep only needed columns
+        manage_df = manage_df[[
+            "DELETE", "trip_date", "car_label", "departure", "arrival", "distance_km", "notes", "id"
+        ]].copy()
+
+        # Ensure text columns are strings (prevents Streamlit type issues)
+        for col in ["departure", "arrival", "notes", "car_label", "id"]:
+            manage_df[col] = manage_df[col].fillna("").astype(str)
 
         edited = st.data_editor(
-            grouped_editor_df,
+            manage_df,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
             column_config={
-                "RowType": st.column_config.TextColumn("Type", disabled=True),
-                "Delete?": st.column_config.CheckboxColumn("Delete?"),
-                "Date": st.column_config.DateColumn("Date"),
-                "Car": st.column_config.SelectboxColumn("Car", options=[""] + car_labels),
-                "Departure": st.column_config.TextColumn("Departure"),
-                "Arrival": st.column_config.TextColumn("Arrival"),
-                "Distance (km)": st.column_config.NumberColumn("Distance (km)", min_value=0.0, step=0.1),
-                "Notes": st.column_config.TextColumn("Notes"),
-                "ID": st.column_config.TextColumn("ID", disabled=True),
+                "DELETE": st.column_config.CheckboxColumn("Delete?"),
+                "trip_date": st.column_config.DateColumn("Date"),
+                "car_label": st.column_config.SelectboxColumn("Car", options=car_labels),
+                "distance_km": st.column_config.NumberColumn("Distance (km)", min_value=0.0, step=0.1),
+                "notes": st.column_config.TextColumn("Notes"),
+                "id": st.column_config.TextColumn("ID", disabled=True),
             },
-            disabled=["ID", "RowType"],
-            key="one_table_editor",
+            disabled=["id"],
+            key="manage_editor",
         )
 
         b1, b2 = st.columns(2)
         with b1:
             if st.button("💾 Save edits", use_container_width=True):
                 changes = 0
+                for i in range(len(edited)):
+                    new_row = edited.iloc[i]
+                    old_row = manage_df.iloc[i]
+                    trip_id = str(new_row["id"])
 
-                original_trips = grouped_editor_df[grouped_editor_df["RowType"] == "TRIP"].copy()
-                original_by_id = {row["ID"]: row for _, row in original_trips.iterrows() if row["ID"]}
-
-                for _, row_new in edited.iterrows():
-                    if row_new.get("RowType") != "TRIP":
-                        continue
-
-                    trip_id = str(row_new.get("ID", "")).strip()
-                    if not trip_id:
-                        continue
-
-                    row_old = original_by_id.get(trip_id)
-                    if row_old is None:
-                        continue
-
-                    if bool(row_new.get("Delete?", False)):
+                    if bool(new_row["DELETE"]):
                         continue
 
                     updates = {}
 
-                    if str(row_new["Date"]) != str(row_old["Date"]):
-                        updates["trip_date"] = str(pd.to_datetime(row_new["Date"]).date())
+                    # Date
+                    if str(new_row["trip_date"]) != str(old_row["trip_date"]):
+                        updates["trip_date"] = str(pd.to_datetime(new_row["trip_date"]).date())
 
-                    if str(row_new["Car"]) != str(row_old["Car"]):
-                        car_label_new = str(row_new["Car"]).strip()
-                        if car_label_new in car_label_to_id:
-                            updates["car_id"] = car_label_to_id[car_label_new]
+                    # Car
+                    if str(new_row["car_label"]) != str(old_row["car_label"]):
+                        updates["car_id"] = car_label_to_id.get(str(new_row["car_label"]))
 
-                    for field_ui, field_db in [("Departure", "departure"), ("Arrival", "arrival"), ("Notes", "notes")]:
-                        nv = "" if pd.isna(row_new[field_ui]) else str(row_new[field_ui]).strip()
-                        ov = "" if pd.isna(row_old[field_ui]) else str(row_old[field_ui]).strip()
+                    # Text fields
+                    for field in ["departure", "arrival", "notes"]:
+                        nv = "" if pd.isna(new_row[field]) else str(new_row[field]).strip()
+                        ov = "" if pd.isna(old_row[field]) else str(old_row[field]).strip()
                         if nv != ov:
-                            updates[field_db] = nv
+                            updates[field] = nv
 
-                    nv_dist = float(row_new["Distance (km)"]) if str(row_new["Distance (km)"]).strip() else 0.0
-                    ov_dist = float(row_old["Distance (km)"]) if str(row_old["Distance (km)"]).strip() else 0.0
-                    if nv_dist != ov_dist:
-                        updates["distance_km"] = nv_dist
+                    # Distance
+                    if float(new_row["distance_km"]) != float(old_row["distance_km"]):
+                        updates["distance_km"] = float(new_row["distance_km"])
 
                     if updates:
                         update_trip(trip_id, updates)
-                        if "departure" in updates:
-                            upsert_place(updates["departure"])
-                        if "arrival" in updates:
-                            upsert_place(updates["arrival"])
+                        upsert_place(str(new_row["departure"]))
+                        upsert_place(str(new_row["arrival"]))
                         changes += 1
 
-                st.success(f"Saved {changes} edited trip(s).")
+                st.success(f"Saved edits on {changes} row(s).")
                 st.rerun()
 
         with b2:
             if st.button("🗑️ Delete selected", use_container_width=True):
-                to_delete = []
-                for _, r in edited.iterrows():
-                    if r.get("RowType") == "TRIP" and bool(r.get("Delete?", False)):
-                        tid = str(r.get("ID", "")).strip()
-                        if tid:
-                            to_delete.append(tid)
-
+                to_delete = edited.loc[edited["DELETE"] == True, "id"].astype(str).tolist()
                 if not to_delete:
-                    st.info("No trips selected for deletion.")
+                    st.info("No rows selected.")
                 else:
                     delete_trips(to_delete)
-                    st.success(f"Deleted {len(to_delete)} trip(s).")
+                    st.success(f"Deleted {len(to_delete)} row(s).")
                     st.rerun()
-
-    st.divider()
-    st.subheader("Export")
-
-    default_name = f"{selected_period_name}_{start_date}_to_{end_date}"
-    file_base = st.text_input("File name", value=default_name, help="Used for CSV / XLSX / PDF.")
-    file_base = (file_base or "trips").strip().replace("/", "-")
-
-    df_export = make_export_df_from_raw(df, car_id_to_label) if not df.empty else pd.DataFrame(
-        columns=["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]
-    )
-
-    csv_bytes = export_csv_bytes(df_export)
-    xlsx_bytes = export_xlsx_bytes(df_export)
-    pdf_bytes = export_pdf_bytes(df_export, f"Trip Logbook — {selected_period_name}", total_km)
-
-    e1, e2, e3 = st.columns(3)
-    with e1:
-        st.download_button("⬇️ CSV", csv_bytes, f"{file_base}.csv", "text/csv", use_container_width=True)
-    with e2:
-        st.download_button(
-            "⬇️ XLSX",
-            xlsx_bytes,
-            f"{file_base}.xlsx",
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
-        )
-    with e3:
-        st.download_button("⬇️ PDF", pdf_bytes, f"{file_base}.pdf", "application/pdf", use_container_width=True)
 
 
 # ---------- ADMIN TAB ----------
