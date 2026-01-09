@@ -26,17 +26,16 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+PLACE_TYPE_NEW = "✍️ Type a new place..."
+
 
 # =========================
 # Supabase Helpers
 # =========================
-def sb_select(table: str, columns: str):
-    return supabase.table(table).select(columns)
-
-
 def get_cars():
     res = (
-        sb_select("cars", "id,name,plate,is_active")
+        supabase.table("cars")
+        .select("id,name,plate")
         .eq("is_active", True)
         .order("name")
         .execute()
@@ -44,9 +43,32 @@ def get_cars():
     return res.data or []
 
 
+def get_periods():
+    res = (
+        supabase.table("periods")
+        .select("id,name")
+        .eq("is_active", True)
+        .order("name", desc=True)  # newest first if using years
+        .execute()
+    )
+    return res.data or []
+
+
+def create_period(name: str):
+    name = (name or "").strip()
+    if not name:
+        return None
+    # unique(name)
+    res = supabase.table("periods").upsert({"name": name, "is_active": True}).execute()
+    # upsert returns list
+    data = res.data or []
+    return data[0] if data else None
+
+
 def get_places(limit=400):
     res = (
-        sb_select("places", "name,is_active")
+        supabase.table("places")
+        .select("name")
         .eq("is_active", True)
         .order("name")
         .limit(limit)
@@ -59,12 +81,12 @@ def upsert_place(name: str):
     name = (name or "").strip()
     if not name:
         return
-    # 'name' is unique; upsert will insert if new, or update is_active if exists.
     supabase.table("places").upsert({"name": name, "is_active": True}).execute()
 
 
-def insert_trip(trip_date, car_id, departure, arrival, distance_km, notes=""):
+def insert_trip(period_id: str, trip_date, car_id, departure, arrival, distance_km, notes=""):
     payload = {
+        "period_id": period_id,
         "trip_date": str(trip_date),
         "car_id": car_id,
         "departure": departure.strip(),
@@ -76,10 +98,12 @@ def insert_trip(trip_date, car_id, departure, arrival, distance_km, notes=""):
     return supabase.table("trip_entries").insert(payload).execute()
 
 
-def fetch_entries(start_date: date, end_date: date, car_id=None, search_text=""):
+def fetch_entries(period_id: str, start_date: date, end_date: date, car_id=None, search_text=""):
+    # IMPORTANT: no embedded join here (fixes your error)
     q = (
         supabase.table("trip_entries")
-        .select("id,trip_date,departure,arrival,distance_km,notes,created_at,updated_at,car_id,cars(name)")
+        .select("id,period_id,trip_date,car_id,departure,arrival,distance_km,notes,created_at,updated_at")
+        .eq("period_id", period_id)
         .gte("trip_date", str(start_date))
         .lte("trip_date", str(end_date))
         .order("trip_date", desc=False)
@@ -90,18 +114,11 @@ def fetch_entries(start_date: date, end_date: date, car_id=None, search_text="")
 
     res = q.execute()
     rows = res.data or []
-
-    # Flatten cars(name) join
-    for r in rows:
-        r["car_name"] = (r.get("cars") or {}).get("name", "")
-        r.pop("cars", None)
-
     df = pd.DataFrame(rows)
 
     if df.empty:
         return df
 
-    # optional search filter
     if search_text.strip():
         s = search_text.strip().lower()
         mask = (
@@ -127,7 +144,7 @@ def delete_trips(trip_ids: list[str]):
 
 
 def fetch_places_admin():
-    res = sb_select("places", "id,name,is_active,created_at").order("name").execute()
+    res = supabase.table("places").select("id,name,is_active,created_at").order("name").execute()
     return pd.DataFrame(res.data or [])
 
 
@@ -136,48 +153,32 @@ def update_place(place_id: str, updates: dict):
 
 
 # =========================
-# Period Helpers
+# UI Helpers
 # =========================
-def period_selector():
-    st.write("### Period")
-    mode = st.radio("Choose period type", ["Year", "Custom range"], horizontal=True)
-    if mode == "Year":
-        current_year = date.today().year
-        years = list(range(current_year - 5, current_year + 6))
-        year = st.selectbox("Year", years, index=years.index(current_year))
-        start = date(year, 1, 1)
-        end = date(year, 12, 31)
-        label = f"{year}"
-        return start, end, label
+def place_picker(label: str, places: list[str], key_prefix: str) -> str:
+    choice = st.selectbox(label, options=(places + [PLACE_TYPE_NEW]), key=f"{key_prefix}_choice")
+    if choice == PLACE_TYPE_NEW:
+        return st.text_input(f"{label} (type)", key=f"{key_prefix}_typed").strip()
+    return (choice or "").strip()
+
+
+def month_range(d: date):
+    start = d.replace(day=1)
+    if start.month == 12:
+        next_month = date(start.year + 1, 1, 1)
     else:
-        c1, c2 = st.columns(2)
-        with c1:
-            start = st.date_input("Start date", value=date(date.today().year, 1, 1))
-        with c2:
-            end = st.date_input("End date", value=date.today())
-        if end < start:
-            st.error("End date must be after start date.")
-        label = f"{start.isoformat()}_to_{end.isoformat()}"
-        return start, end, label
+        next_month = date(start.year, start.month + 1, 1)
+    last_day = (pd.Timestamp(next_month) - pd.Timedelta(days=1)).date()
+    return start, last_day
 
 
-# =========================
-# Export Helpers
-# =========================
-def make_export_df(df: pd.DataFrame) -> pd.DataFrame:
+def make_export_df(df: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
-    cols = ["trip_date", "car_name", "departure", "arrival", "distance_km", "notes"]
-    out = out[cols]
-    out = out.rename(columns={
-        "trip_date": "Date",
-        "car_name": "Car",
-        "departure": "Departure",
-        "arrival": "Arrival",
-        "distance_km": "Distance (km)",
-        "notes": "Notes",
-    })
+    out["car_name"] = out["car_id"].map(car_id_to_label).fillna("")
+    out = out[["trip_date", "car_name", "departure", "arrival", "distance_km", "notes"]].copy()
+    out.columns = ["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]
     out["Date"] = pd.to_datetime(out["Date"]).dt.date.astype(str)
     return out
 
@@ -209,21 +210,19 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     y -= 20
     c.setFont("Helvetica", 11)
     c.drawString(x, y, f"Total distance: {total_km:.1f} km")
-
     y -= 25
 
     if df.empty:
         c.setFont("Helvetica", 10)
-        c.drawString(x, y, "No trips found for this period.")
+        c.drawString(x, y, "No trips found for this selection.")
         c.showPage()
         c.save()
         return buff.getvalue()
 
-    # Table layout
     headers = list(df.columns)
-    col_widths = [75, 65, 135, 135, 70, 120]  # fits A4 reasonably
-    c.setFont("Helvetica-Bold", 9)
+    col_widths = [75, 70, 135, 135, 75, 120]
 
+    c.setFont("Helvetica-Bold", 9)
     xx = x
     for name, cw in zip(headers, col_widths):
         c.drawString(xx, y, str(name)[:18])
@@ -252,18 +251,6 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
 
 
 # =========================
-# UI Helpers (Place picker)
-# =========================
-PLACE_TYPE_NEW = "✍️ Type a new place..."
-
-def place_picker(label: str, places: list[str], key_prefix: str) -> str:
-    choice = st.selectbox(label, options=(places + [PLACE_TYPE_NEW]), key=f"{key_prefix}_choice")
-    if choice == PLACE_TYPE_NEW:
-        return st.text_input(f"{label} (type)", key=f"{key_prefix}_typed").strip()
-    return choice.strip()
-
-
-# =========================
 # Session State
 # =========================
 if "is_admin" not in st.session_state:
@@ -271,13 +258,13 @@ if "is_admin" not in st.session_state:
 
 
 # =========================
-# App Header
+# Header
 # =========================
 st.title(APP_TITLE)
 
-with st.expander("🔐 Admin mode", expanded=False):
+with st.expander("🔐 Admin mode"):
     if not ADMIN_PIN:
-        st.info("Set ADMIN_PIN in your Streamlit secrets to enable Admin mode.")
+        st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin mode.")
     pin = st.text_input("Enter admin PIN", type="password")
     c1, c2 = st.columns(2)
     with c1:
@@ -294,16 +281,44 @@ with st.expander("🔐 Admin mode", expanded=False):
 
 
 # =========================
-# Load cars / maps
+# Period selector (logbooks)
+# =========================
+st.subheader("Period (logbook)")
+
+periods = get_periods()
+if not periods:
+    create_period("Default")
+    periods = get_periods()
+
+period_name_to_id = {p["name"]: p["id"] for p in periods}
+period_names = list(period_name_to_id.keys())
+
+colp1, colp2 = st.columns([2, 1])
+with colp1:
+    selected_period_name = st.selectbox("Choose period", period_names)
+    selected_period_id = period_name_to_id[selected_period_name]
+
+with colp2:
+    new_period_name = st.text_input("New period name", placeholder="e.g. 2027")
+    if st.button("➕ Add period", use_container_width=True):
+        if new_period_name.strip():
+            create_period(new_period_name.strip())
+            st.success("Period added.")
+            st.rerun()
+        else:
+            st.error("Type a name first (e.g. 2027).")
+
+
+# =========================
+# Cars maps
 # =========================
 cars = get_cars()
 if not cars:
-    st.error("No cars found. Add cars in Supabase table 'cars' or run the SQL starter insert.")
+    st.error("No cars found. Add cars in Supabase table 'cars'.")
     st.stop()
 
 car_label_to_id = {}
 car_id_to_label = {}
-
 for c in cars:
     label = c["name"] + (f" ({c['plate']})" if c.get("plate") else "")
     car_label_to_id[label] = c["id"]
@@ -313,14 +328,13 @@ car_labels = list(car_label_to_id.keys())
 
 
 # =========================
-# Add Trip (Dad-friendly)
+# Add Trip
 # =========================
 st.subheader("Add a trip")
-
 places = get_places()
 
 with st.container(border=True):
-    col1, col2 = st.columns([1, 1])
+    col1, col2 = st.columns(2)
     with col1:
         trip_date = st.date_input("Date", value=date.today())
     with col2:
@@ -330,7 +344,7 @@ with st.container(border=True):
     departure = place_picker("Departure", places, "dep")
     arrival = place_picker("Arrival", places, "arr")
 
-    col3, col4 = st.columns([1, 1])
+    col3, col4 = st.columns(2)
     with col3:
         distance = st.number_input("Distance (km)", min_value=0.0, step=0.1, format="%.1f")
     with col4:
@@ -340,7 +354,7 @@ with st.container(border=True):
         if not departure or not arrival:
             st.error("Please fill in Departure and Arrival.")
         else:
-            insert_trip(trip_date, car_id, departure, arrival, distance, notes)
+            insert_trip(selected_period_id, trip_date, car_id, departure, arrival, distance, notes)
             upsert_place(departure)
             upsert_place(arrival)
             st.success("Saved!")
@@ -350,12 +364,22 @@ with st.container(border=True):
 st.divider()
 
 # =========================
-# Overview + Period + Filters
+# Date range (filter inside a period)
 # =========================
-period_start, period_end, period_label = period_selector()
+st.subheader("Filters")
 
-st.write("### Filters")
-f1, f2 = st.columns([1, 1])
+mode = st.radio("Range", ["This month", "Custom range"], horizontal=True)
+if mode == "This month":
+    pick = st.date_input("Pick any day in the month", value=date.today())
+    start_date, end_date = month_range(pick)
+else:
+    cA, cB = st.columns(2)
+    with cA:
+        start_date = st.date_input("Start date", value=date(date.today().year, 1, 1))
+    with cB:
+        end_date = st.date_input("End date", value=date.today())
+
+f1, f2 = st.columns(2)
 with f1:
     filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
 with f2:
@@ -363,23 +387,19 @@ with f2:
 
 filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
 
-df = fetch_entries(period_start, period_end, car_id=filter_car_id, search_text=search_text)
-df_export = make_export_df(df)
+df = fetch_entries(selected_period_id, start_date, end_date, car_id=filter_car_id, search_text=search_text)
+total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
 
-total_km = 0.0
-if not df.empty:
-    total_km = float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
+st.metric("Total distance (selected)", f"{total_km:.1f} km")
 
-st.metric(
-    label=f"Total distance ({period_label})" + ("" if filter_car == "All cars" else f" • {filter_car}"),
-    value=f"{total_km:.1f} km",
-)
+df_export = make_export_df(df, car_id_to_label)
 
 st.write("### Trips")
 if df_export.empty:
-    st.info("No trips found for this period/filter.")
+    st.info("No trips found.")
 else:
     st.dataframe(df_export, use_container_width=True, hide_index=True)
+
 
 # =========================
 # Export
@@ -387,14 +407,18 @@ else:
 st.write("### Export")
 csv_bytes = export_csv_bytes(df_export)
 xlsx_bytes = export_xlsx_bytes(df_export)
-pdf_bytes = export_pdf_bytes(df_export, f"Trip Logbook — {period_label}", total_km)
+pdf_bytes = export_pdf_bytes(
+    df_export,
+    title=f"Trip Logbook — {selected_period_name} ({start_date} to {end_date})",
+    total_km=total_km
+)
 
 e1, e2, e3 = st.columns(3)
 with e1:
     st.download_button(
         "⬇️ CSV",
         data=csv_bytes,
-        file_name=f"trips_{period_label}.csv",
+        file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.csv",
         mime="text/csv",
         use_container_width=True,
     )
@@ -402,7 +426,7 @@ with e2:
     st.download_button(
         "⬇️ XLSX",
         data=xlsx_bytes,
-        file_name=f"trips_{period_label}.xlsx",
+        file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         use_container_width=True,
     )
@@ -410,7 +434,7 @@ with e3:
     st.download_button(
         "⬇️ PDF",
         data=pdf_bytes,
-        file_name=f"trips_{period_label}.pdf",
+        file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.pdf",
         mime="application/pdf",
         use_container_width=True,
     )
@@ -418,31 +442,19 @@ with e3:
 st.divider()
 
 # =========================
-# Manage Trips (Edit/Delete) - Dad can do it
+# Manage trips (edit/delete)
 # =========================
 st.subheader("Manage trips (edit / delete)")
 
 if df.empty:
-    st.info("Nothing to manage for this period.")
+    st.info("Nothing to manage for this selection.")
 else:
     manage_df = df.copy()
-
-    # Friendly car label column for editing
     manage_df["car_label"] = manage_df["car_id"].map(car_id_to_label).fillna("")
-
-    # Add delete checkbox
     manage_df["DELETE"] = False
 
-    # Keep only what we want to edit + id
     manage_df = manage_df[[
-        "DELETE",
-        "trip_date",
-        "car_label",
-        "departure",
-        "arrival",
-        "distance_km",
-        "notes",
-        "id",
+        "DELETE", "trip_date", "car_label", "departure", "arrival", "distance_km", "notes", "id"
     ]].copy()
 
     edited = st.data_editor(
@@ -466,23 +478,21 @@ else:
     with b1:
         if st.button("💾 Save edits", use_container_width=True):
             changes = 0
-
             for i in range(len(edited)):
                 new_row = edited.iloc[i]
                 old_row = manage_df.iloc[i]
-
                 trip_id = str(new_row["id"])
+
                 if bool(new_row["DELETE"]):
                     continue
 
                 updates = {}
 
-                # Compare fields
                 if str(new_row["trip_date"]) != str(old_row["trip_date"]):
                     updates["trip_date"] = str(pd.to_datetime(new_row["trip_date"]).date())
 
                 if str(new_row["car_label"]) != str(old_row["car_label"]):
-                    updates["car_id"] = car_label_to_id.get(str(new_row["car_label"]), None)
+                    updates["car_id"] = car_label_to_id.get(str(new_row["car_label"]))
 
                 for field in ["departure", "arrival", "notes"]:
                     if str(new_row[field]) != str(old_row[field]):
@@ -491,13 +501,8 @@ else:
                 if str(new_row["distance_km"]) != str(old_row["distance_km"]):
                     updates["distance_km"] = float(new_row["distance_km"])
 
-                # Clean invalid updates
-                if updates.get("car_id") is None and "car_id" in updates:
-                    updates.pop("car_id", None)
-
                 if updates:
                     update_trip(trip_id, updates)
-                    # Keep place history updated
                     upsert_place(str(new_row["departure"]))
                     upsert_place(str(new_row["arrival"]))
                     changes += 1
@@ -509,14 +514,15 @@ else:
         if st.button("🗑️ Delete selected", use_container_width=True):
             to_delete = edited.loc[edited["DELETE"] == True, "id"].astype(str).tolist()
             if not to_delete:
-                st.info("No rows selected for deletion.")
+                st.info("No rows selected.")
             else:
                 delete_trips(to_delete)
                 st.success(f"Deleted {len(to_delete)} row(s).")
                 st.rerun()
 
+
 # =========================
-# Admin Panel (Extra features)
+# Admin panel (places manager)
 # =========================
 if st.session_state.is_admin:
     st.divider()
@@ -525,12 +531,9 @@ if st.session_state.is_admin:
     st.write("### Places manager")
     places_df = fetch_places_admin()
     if places_df.empty:
-        st.info("No places yet. They will appear automatically when trips are saved.")
+        st.info("No places yet.")
     else:
-        # Add a column to toggle active/inactive and allow renaming
         places_df = places_df[["id", "name", "is_active", "created_at"]].copy()
-        places_df = places_df.sort_values("name")
-
         edited_places = st.data_editor(
             places_df,
             use_container_width=True,
@@ -548,7 +551,6 @@ if st.session_state.is_admin:
 
         if st.button("💾 Save place changes", use_container_width=True):
             changed = 0
-            # Compare row-by-row (same order)
             for i in range(len(edited_places)):
                 n = edited_places.iloc[i]
                 o = places_df.iloc[i]
@@ -561,17 +563,8 @@ if st.session_state.is_admin:
                     updates["is_active"] = bool(n["is_active"])
 
                 if updates:
-                    try:
-                        update_place(pid, updates)
-                        changed += 1
-                    except Exception as e:
-                        st.error(f"Could not update place '{o['name']}': {e}")
+                    update_place(pid, updates)
+                    changed += 1
 
             st.success(f"Updated {changed} place(s).")
             st.rerun()
-
-    st.write("### Admin tips")
-    st.caption(
-        "If you want the app private/secure later, we can enable RLS and add login or a shared access PIN. "
-        "Right now, Admin mode protects admin tools inside the app, but database security depends on RLS settings."
-    )
