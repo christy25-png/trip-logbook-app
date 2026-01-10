@@ -18,13 +18,13 @@ from openpyxl.utils import get_column_letter
 # =========================
 # CONFIG
 # =========================
-st.set_page_config(page_title="Trip Logbook", layout="centered")
+st.set_page_config(page_title="ACEM Car Log", layout="centered")
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 SUPABASE_KEY_FALLBACK = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", os.getenv("ADMIN_PIN", ""))
-APP_TITLE = st.secrets.get("APP_TITLE", os.getenv("APP_TITLE", "🚗 Trip Logbook"))
+APP_TITLE = "ACEM Car Log"
 
 if not SUPABASE_URL:
     st.error("Missing SUPABASE_URL in Streamlit secrets.")
@@ -195,12 +195,41 @@ def deactivate_places(place_ids: list[str]):
     )
 
 
-def hard_delete_places(place_ids: list[str]):
+def force_delete_places(place_ids: list[str]):
+    """
+    Force hard delete:
+      - delete route_distances rows referencing those places
+      - set trip_entries departure/arrival place ids to NULL
+      - delete places rows
+    Trips remain because addresses are stored in departure_address/arrival_address.
+    """
     if not place_ids:
         return None
+
+    # 1) delete route distance memory rows
+    safe_execute(
+        supabase.table("route_distances").delete().in_("place_a", place_ids),
+        "force_delete_places(): delete route_distances place_a",
+    )
+    safe_execute(
+        supabase.table("route_distances").delete().in_("place_b", place_ids),
+        "force_delete_places(): delete route_distances place_b",
+    )
+
+    # 2) detach from trips (keep addresses)
+    safe_execute(
+        supabase.table("trip_entries").update({"departure_place_id": None}).in_("departure_place_id", place_ids),
+        "force_delete_places(): null trip_entries.departure_place_id",
+    )
+    safe_execute(
+        supabase.table("trip_entries").update({"arrival_place_id": None}).in_("arrival_place_id", place_ids),
+        "force_delete_places(): null trip_entries.arrival_place_id",
+    )
+
+    # 3) delete places
     return safe_execute(
         supabase.table("places").delete().in_("id", place_ids),
-        "hard_delete_places()",
+        "force_delete_places(): delete places",
     )
 
 
@@ -298,7 +327,6 @@ def fetch_entries(period_id: str, start_date: date, end_date: date, car_id=None,
     return df
 
 
-# Places history (backup)
 def fetch_places_history(limit=500):
     res = safe_execute(
         supabase.table("places_history")
@@ -320,7 +348,7 @@ def delete_places_history(history_ids: list[str]):
 
 
 # =========================
-# VIEW HELPERS
+# MONTH HELPERS + EXPORTS (same as your working version)
 # =========================
 def month_range(d: date):
     start = d.replace(day=1)
@@ -361,9 +389,6 @@ def monthly_totals(df: pd.DataFrame) -> pd.DataFrame:
     return totals[["Month", "Total distance (km)"]]
 
 
-# =========================
-# EXPORTS
-# =========================
 def make_export_df(df: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
     if df.empty:
         return df
@@ -423,7 +448,6 @@ def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, tit
         ws_summary.freeze_panes = "A5"
         _autosize_worksheet(ws_summary)
 
-    # Month sheets
     if not df_raw.empty and not df_export.empty:
         d = add_month_columns(df_raw)
         work = df_export.copy()
@@ -566,26 +590,24 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
 
 
 # =========================
-# SESSION STATE (SWAP THAT WORKS)
+# SESSION STATE (swap works already in your build)
 # =========================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
-
-# Controlled values (not widget keys)
 if "dep_value" not in st.session_state:
     st.session_state.dep_value = None
 if "arr_value" not in st.session_state:
     st.session_state.arr_value = None
-
-# Swap flag
 if "swap_requested" not in st.session_state:
     st.session_state.swap_requested = False
-
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
-
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
+
+
+def request_swap():
+    st.session_state.swap_requested = True
 
 
 def maybe_autofill_distance(dep_id: str, arr_id: str):
@@ -600,20 +622,14 @@ def maybe_autofill_distance(dep_id: str, arr_id: str):
             st.session_state.distance_value = round_half(max(0.0, float(mem)))
 
 
-def request_swap():
-    # This runs BEFORE the next rerun renders widgets
-    st.session_state.swap_requested = True
-
-
 # =========================
 # UI
 # =========================
 st.title(APP_TITLE)
 tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
 
-
-# ---------- TRIP LOG ----------
 with tabs[0]:
+    # Admin unlock
     with st.expander("🔐 Admin mode"):
         if not ADMIN_PIN:
             st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin features.")
@@ -699,31 +715,26 @@ with tabs[0]:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        # Initialize controlled values
         if st.session_state.dep_value is None:
             st.session_state.dep_value = place_labels[0]
         if st.session_state.arr_value is None:
             st.session_state.arr_value = place_labels[0] if len(place_labels) == 1 else place_labels[1]
 
-        # Keep them valid
         if st.session_state.dep_value not in place_labels:
             st.session_state.dep_value = place_labels[0]
         if st.session_state.arr_value not in place_labels:
             st.session_state.arr_value = place_labels[0] if len(place_labels) == 1 else place_labels[1]
 
-        # ✅ APPLY SWAP BEFORE WIDGETS RENDER
         if st.session_state.swap_requested:
             st.session_state.swap_requested = False
             st.session_state.dep_value, st.session_state.arr_value = (
                 st.session_state.arr_value,
                 st.session_state.dep_value,
             )
-            # Pre-fill widget state BEFORE widgets exist
             st.session_state["dep_widget"] = st.session_state.dep_value
             st.session_state["arr_widget"] = st.session_state.arr_value
 
         colD, colS, colA = st.columns([1, 1, 1])
-
         with colD:
             dep_label = st.selectbox(
                 "Departure (place name)",
@@ -741,7 +752,6 @@ with tabs[0]:
         with colS:
             st.button("↔ Swap", use_container_width=True, on_click=request_swap)
 
-        # Sync controlled values from widgets
         st.session_state.dep_value = dep_label
         st.session_state.arr_value = arr_label
 
@@ -760,7 +770,6 @@ with tabs[0]:
                 step=0.5,
                 value=float(st.session_state.distance_value),
                 key="distance_value",
-                help="Autofills from memory if known. You can still change it.",
             )
         with col4:
             notes = st.text_input("Notes (optional)")
@@ -788,7 +797,6 @@ with tabs[0]:
 
     st.divider()
 
-    # View trips
     st.subheader("View trips")
     view_mode = st.radio(
         "View mode",
@@ -834,7 +842,6 @@ with tabs[0]:
     else:
         st.dataframe(df_export, use_container_width=True, hide_index=True)
 
-    # Export
     st.divider()
     st.subheader("Export")
 
@@ -847,23 +854,33 @@ with tabs[0]:
     )
 
     csv_bytes = export_csv_bytes(export_df)
+    title = f"{APP_TITLE} — {selected_period_name}"
+    xlsx_bytes = export_xlsx_bytes_grouped(export_df, df, title)
+    pdf_bytes = export_pdf_bytes_grouped(export_df, df, title)
 
-    # keep your existing XLSX/PDF functions if you want them here
-    # (omitted here since swap fix was the urgent part)
-    st.download_button("⬇️ CSV", csv_bytes, f"{file_base}.csv", "text/csv", use_container_width=True)
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.download_button("⬇️ CSV", csv_bytes, f"{file_base}.csv", "text/csv", use_container_width=True)
+    with e2:
+        st.download_button(
+            "⬇️ XLSX",
+            xlsx_bytes,
+            f"{file_base}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    with e3:
+        st.download_button("⬇️ PDF", pdf_bytes, f"{file_base}.pdf", "application/pdf", use_container_width=True)
 
-
-# ---------- ADMIN ----------
 with tabs[1]:
     if not st.session_state.is_admin:
         st.info("Admin is locked. Unlock it in the Trip Log tab.")
         st.stop()
 
     st.header("Admin Panel")
+    st.subheader("Places (edit / deactivate / force delete)")
 
-    st.subheader("Places (edit / deactivate / delete)")
     all_places = get_places(active_only=False)
-
     if not all_places:
         st.info("No places yet.")
     else:
@@ -916,15 +933,18 @@ with tabs[1]:
                 st.rerun()
 
         with c3:
-            if st.button("🧨 Hard delete selected (unused only)", use_container_width=True):
+            if st.button("🧨 Force hard delete selected", use_container_width=True):
                 selected = edited.loc[edited["SELECT"] == True, "id"].astype(str).tolist()
-                hard_delete_places(selected)  # will fail if referenced by trips; error will show
-                st.rerun()
+                if not selected:
+                    st.info("Select at least one place.")
+                else:
+                    force_delete_places(selected)
+                    st.success(f"Force deleted {len(selected)} place(s).")
+                    st.rerun()
 
     st.divider()
     st.subheader("Places history (backup)")
     hist = fetch_places_history(limit=500)
-
     if hist.empty:
         st.info("No history yet.")
     else:
