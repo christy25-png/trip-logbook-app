@@ -88,14 +88,16 @@ def distance_wheel_picker_html(
 ) -> float:
     """
     iOS-style wheel picker using an HTML component.
-    Returns float. Uses wrap effect by repeating list 3x.
+    FIXED snapping: it will not stop between values.
+
+    Uses top/bottom spacer divs (instead of padding) so snapping math is exact.
     Compatibility: does NOT pass key= into components.html().
     """
-    values = []
+    # Build value list
     steps = int(round((max_value - min_value) / step))
-    for i in range(steps + 1):
-        values.append(round(min_value + i * step, 1))
+    values = [round(min_value + i * step, 1) for i in range(steps + 1)]
 
+    # clamp & round incoming value
     if value is None:
         value = min_value
     value = float(value)
@@ -103,6 +105,7 @@ def distance_wheel_picker_html(
     value = round(value / step) * step
     value = round(value, 1)
 
+    # Repeat 3x for "infinite" feel
     values_3x = values + values + values
     base_len = len(values)
 
@@ -110,8 +113,12 @@ def distance_wheel_picker_html(
         idx_in_base = values.index(value)
     except ValueError:
         idx_in_base = 0
-    initial_index = base_len + idx_in_base
 
+    # We will have spacer as first child => item index offset = +1
+    initial_index_in_middle = base_len + idx_in_base
+    initial_child_index = 1 + initial_index_in_middle  # +1 because spacer is child 0
+
+    # HTML options
     options_html = "\n".join(
         f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
         for val in values_3x
@@ -126,7 +133,7 @@ def distance_wheel_picker_html(
         <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
         <style>
           :root {{
-            --h: 28px;  /* row height */
+            --h: 28px; /* row height */
           }}
           body {{
             margin: 0;
@@ -146,9 +153,13 @@ def distance_wheel_picker_html(
           .list {{
             height: 100%;
             overflow-y: scroll;
-            scrollbar-width: thin;
             scroll-snap-type: y mandatory;
-            padding: calc({height_px}px/2 - var(--h)/2) 0;
+            -webkit-overflow-scrolling: touch;
+            scrollbar-width: thin;
+          }}
+          .spacer {{
+            height: calc({height_px}px/2 - var(--h)/2);
+            scroll-snap-align: start;
           }}
           .item {{
             height: var(--h);
@@ -193,13 +204,17 @@ def distance_wheel_picker_html(
           }}
         </style>
       </head>
+
       <body>
         <div class="wheel">
           <div class="fade-top"></div>
           <div class="fade-bottom"></div>
           <div class="center-highlight"></div>
+
           <div id="{list_id}" class="list">
+            <div class="spacer"></div>
             {options_html}
+            <div class="spacer"></div>
           </div>
         </div>
 
@@ -207,81 +222,92 @@ def distance_wheel_picker_html(
           const list = document.getElementById("{list_id}");
           const rowH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--h'));
           const baseLen = {base_len};
-          const initialIndex = {initial_index};
+          const initialChildIndex = {initial_child_index};
 
-          function setActiveByIndex(idx) {{
-            const items = list.querySelectorAll(".item");
+          function itemsOnly() {{
+            // children: [spacer, item..., spacer]
+            // items are from index 1 to length-2
+            return Array.from(list.children).slice(1, list.children.length - 1);
+          }}
+
+          function setActiveItem(itemIndex) {{
+            const items = itemsOnly();
             items.forEach(el => el.classList.remove("active"));
-            if (items[idx]) items[idx].classList.add("active");
+            if (items[itemIndex]) items[itemIndex].classList.add("active");
           }}
 
-          function nearestIndex() {{
-            const center = list.scrollTop + (list.clientHeight / 2);
-            const idx = Math.round((center - (rowH / 2)) / rowH);
-            return Math.max(0, Math.min(idx, list.children.length - 1));
+          function scrollTopForItem(itemIndex) {{
+            // Because we have top spacer as first child with height = (H/2 - rowH/2),
+            // the "centered" scrollTop for item i is:
+            // spacerHeight + i*rowH - (H/2 - rowH/2)
+            // which simplifies to i*rowH
+            // (this is exactly why spacers fix snapping)
+            return itemIndex * rowH;
           }}
 
-          function valueAtIndex(idx) {{
-            const el = list.children[idx];
+          function nearestItemIndex() {{
+            // Perfect mapping with spacers: centered index equals round(scrollTop/rowH)
+            return Math.max(0, Math.min(Math.round(list.scrollTop / rowH), itemsOnly().length - 1));
+          }}
+
+          function valueAtItem(itemIndex) {{
+            const items = itemsOnly();
+            const el = items[itemIndex];
             if (!el) return null;
             return parseFloat(el.dataset.value);
           }}
 
-          let debounce = null;
-
           function sendValue(val) {{
-            if (window.Streamlit) {{
-              window.Streamlit.setComponentValue(val);
-            }}
+            if (window.Streamlit) window.Streamlit.setComponentValue(val);
           }}
 
+          let debounce = null;
+
           function snapAndWrap() {{
-            const idx = nearestIndex();
-            const val = valueAtIndex(idx);
-            if (val === null) return;
+            const idx = nearestItemIndex();
+            const items = itemsOnly();
+            if (!items[idx]) return;
 
-            const targetScroll = idx * rowH - (list.clientHeight/2 - rowH/2);
-            list.scrollTo({{ top: targetScroll, behavior: "auto" }});
+            // snap exactly
+            list.scrollTo({{ top: scrollTopForItem(idx), behavior: "auto" }});
 
-            let idxIn3 = idx;
-            if (idxIn3 < baseLen) {{
-              idxIn3 = idxIn3 + baseLen;
-            }} else if (idxIn3 >= baseLen*2) {{
-              idxIn3 = idxIn3 - baseLen;
+            // wrap logic: idx is within 3x list (0..3*baseLen-1)
+            let idx3 = idx;
+            if (idx3 < baseLen) {{
+              idx3 = idx3 + baseLen;
+            }} else if (idx3 >= baseLen * 2) {{
+              idx3 = idx3 - baseLen;
             }}
 
-            const val2 = valueAtIndex(idxIn3);
-            const targetScroll2 = idxIn3 * rowH - (list.clientHeight/2 - rowH/2);
-            if (Math.abs(targetScroll2 - list.scrollTop) > 1) {{
-              list.scrollTo({{ top: targetScroll2, behavior: "auto" }});
-            }}
-
-            setActiveByIndex(idxIn3);
+            const val2 = valueAtItem(idx3);
+            list.scrollTo({{ top: scrollTopForItem(idx3), behavior: "auto" }});
+            setActiveItem(idx3);
             sendValue(val2);
           }}
 
           function init() {{
-            const targetScroll = initialIndex * rowH - (list.clientHeight/2 - rowH/2);
-            list.scrollTo({{ top: targetScroll, behavior: "auto" }});
-            setActiveByIndex(initialIndex);
-            sendValue(valueAtIndex(initialIndex));
+            // initial position
+            const initialItemIndex = initialChildIndex - 1; // convert child index -> item index
+            list.scrollTo({{ top: scrollTopForItem(initialItemIndex), behavior: "auto" }});
+            setActiveItem(initialItemIndex);
+            sendValue(valueAtItem(initialItemIndex));
             if (window.Streamlit) window.Streamlit.setFrameHeight({height_px});
           }}
 
           list.addEventListener("scroll", () => {{
             if (debounce) clearTimeout(debounce);
-            debounce = setTimeout(snapAndWrap, 140);
+            debounce = setTimeout(snapAndWrap, 120);
           }});
 
           list.addEventListener("click", (e) => {{
             const item = e.target.closest(".item");
             if (!item) return;
-            const items = Array.from(list.children);
+            const items = itemsOnly();
             const idx = items.indexOf(item);
-            const targetScroll = idx * rowH - (list.clientHeight/2 - rowH/2);
-            list.scrollTo({{ top: targetScroll, behavior: "smooth" }});
+            if (idx < 0) return;
+            list.scrollTo({{ top: scrollTopForItem(idx), behavior: "smooth" }});
             if (debounce) clearTimeout(debounce);
-            debounce = setTimeout(snapAndWrap, 180);
+            debounce = setTimeout(snapAndWrap, 220);
           }});
 
           window.addEventListener("load", init);
