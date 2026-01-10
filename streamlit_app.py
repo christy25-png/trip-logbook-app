@@ -74,9 +74,7 @@ def parse_year_from_period_name(name: str) -> int:
 
 
 # =========================
-# iOS-LIKE WHEEL PICKER (Distance)
-# - compact by default
-# - tap/click to open wheel
+# iOS-LIKE WHEEL PICKER (Distance) — FIXED SNAPPING
 # =========================
 def distance_wheel_picker_html(
     key: str,
@@ -225,8 +223,6 @@ def distance_wheel_picker_html(
           const initialChildIndex = {initial_child_index};
 
           function itemsOnly() {{
-            // children: [spacer, item..., spacer]
-            // items are from index 1 to length-2
             return Array.from(list.children).slice(1, list.children.length - 1);
           }}
 
@@ -237,16 +233,11 @@ def distance_wheel_picker_html(
           }}
 
           function scrollTopForItem(itemIndex) {{
-            // Because we have top spacer as first child with height = (H/2 - rowH/2),
-            // the "centered" scrollTop for item i is:
-            // spacerHeight + i*rowH - (H/2 - rowH/2)
-            // which simplifies to i*rowH
-            // (this is exactly why spacers fix snapping)
+            // With spacers, perfect centered mapping becomes scrollTop = itemIndex * rowH
             return itemIndex * rowH;
           }}
 
           function nearestItemIndex() {{
-            // Perfect mapping with spacers: centered index equals round(scrollTop/rowH)
             return Math.max(0, Math.min(Math.round(list.scrollTop / rowH), itemsOnly().length - 1));
           }}
 
@@ -286,8 +277,7 @@ def distance_wheel_picker_html(
           }}
 
           function init() {{
-            // initial position
-            const initialItemIndex = initialChildIndex - 1; // convert child index -> item index
+            const initialItemIndex = initialChildIndex - 1; // child index -> item index
             list.scrollTo({{ top: scrollTopForItem(initialItemIndex), behavior: "auto" }});
             setActiveItem(initialItemIndex);
             sendValue(valueAtItem(initialItemIndex));
@@ -714,7 +704,7 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
     buff = io.BytesIO()
     c = canvas.Canvas(buff, pagesize=A4)
 
-    width, height = A4
+    _, height = A4
     left = 40
     top = height - 50
 
@@ -825,8 +815,11 @@ if "arr_typed" not in st.session_state:
 
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
-if "distance_manual" not in st.session_state:
-    st.session_state.distance_manual = False
+if "distance_candidate" not in st.session_state:
+    st.session_state.distance_candidate = float(st.session_state.distance_value)
+if "distance_confirmed" not in st.session_state:
+    st.session_state.distance_confirmed = True
+
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
 
@@ -862,7 +855,6 @@ def maybe_autofill_distance(places_list: list[str]):
         return
     if rk != st.session_state.last_route_key:
         st.session_state.last_route_key = rk
-        st.session_state.distance_manual = False
         dep = get_dep_value(places_list)
         arr = get_arr_value(places_list)
         mem = get_route_distance(dep, arr)
@@ -871,6 +863,8 @@ def maybe_autofill_distance(places_list: list[str]):
             mem = max(1.0, min(200.0, mem))
             mem = round(mem * 2) / 2.0  # nearest 0.5
             st.session_state.distance_value = mem
+            st.session_state.distance_candidate = mem
+            st.session_state.distance_confirmed = True
 
 
 # =========================
@@ -1013,8 +1007,14 @@ with tabs[0]:
 
         col3, col4 = st.columns(2)
         with col3:
-            # Compact "input field" look + tap to open picker
+            # Compact "input field" look + tap to open picker (with Confirm)
             st.caption("Distance (km)")
+
+            # Keep candidate in sync if needed
+            if "distance_candidate" not in st.session_state:
+                st.session_state.distance_candidate = float(st.session_state.distance_value)
+
+            confirmed_badge = "✅" if st.session_state.get("distance_confirmed", True) else "🟡"
             st.markdown(
                 f"""
                 <div style="
@@ -1028,6 +1028,9 @@ with tabs[0]:
                     ">
                     <div style="font-size:18px; font-weight:800;">
                         {float(st.session_state.distance_value):.1f} km
+                        <span style="font-size:14px; font-weight:600; opacity:0.75; margin-left:8px;">
+                            {confirmed_badge}
+                        </span>
                     </div>
                     <div style="opacity:0.7; font-size:14px;">
                         ✏️ edit
@@ -1038,34 +1041,44 @@ with tabs[0]:
             )
 
             has_popover = hasattr(st, "popover")
+
+            def picker_body():
+                picked = distance_wheel_picker_html(
+                    key="distance_wheel",
+                    value=float(st.session_state.distance_candidate),
+                    min_value=1.0,
+                    max_value=200.0,
+                    step=0.5,
+                    height_px=160,
+                )
+
+                if float(picked) != float(st.session_state.distance_candidate):
+                    st.session_state.distance_candidate = float(picked)
+                    st.session_state.distance_confirmed = False
+
+                st.caption(f"Selected: **{float(st.session_state.distance_candidate):.1f} km**")
+
+                cA, cB = st.columns([1, 1])
+                with cA:
+                    if st.button("✅ Use this distance", use_container_width=True, key="confirm_distance"):
+                        st.session_state.distance_value = float(st.session_state.distance_candidate)
+                        st.session_state.distance_confirmed = True
+                        st.success(f"Distance set to {float(st.session_state.distance_value):.1f} km")
+                        st.rerun()
+
+                with cB:
+                    if st.button("↩️ Cancel", use_container_width=True, key="cancel_distance"):
+                        st.session_state.distance_candidate = float(st.session_state.distance_value)
+                        st.session_state.distance_confirmed = True
+                        st.info("No changes made.")
+                        st.rerun()
+
             if has_popover:
                 with st.popover("Change distance", use_container_width=True):
-                    picked = distance_wheel_picker_html(
-                        key="distance_wheel",
-                        value=float(st.session_state.distance_value),
-                        min_value=1.0,
-                        max_value=200.0,
-                        step=0.5,
-                        height_px=160,  # smaller wheel
-                    )
-                    if float(picked) != float(st.session_state.distance_value):
-                        st.session_state.distance_value = float(picked)
-                        st.session_state.distance_manual = True
-                    st.caption("Scroll to select. Tap outside to close.")
+                    picker_body()
             else:
                 with st.expander("Change distance"):
-                    picked = distance_wheel_picker_html(
-                        key="distance_wheel",
-                        value=float(st.session_state.distance_value),
-                        min_value=1.0,
-                        max_value=200.0,
-                        step=0.5,
-                        height_px=160,
-                    )
-                    if float(picked) != float(st.session_state.distance_value):
-                        st.session_state.distance_value = float(picked)
-                        st.session_state.distance_manual = True
-                    st.caption("Scroll to select. Close this section when done.")
+                    picker_body()
 
             distance = float(st.session_state.distance_value)
 
@@ -1073,6 +1086,11 @@ with tabs[0]:
             notes = st.text_input("Notes (optional)")
 
         if st.button("✅ Save trip", use_container_width=True):
+            # Optional safety: require confirmation before saving
+            if not st.session_state.get("distance_confirmed", True):
+                st.error("Please confirm the distance first (tap 'Use this distance').")
+                st.stop()
+
             departure = get_dep_value(places)
             arrival = get_arr_value(places)
 
@@ -1083,7 +1101,7 @@ with tabs[0]:
                 upsert_place(departure)
                 upsert_place(arrival)
                 set_route_distance(departure, arrival, float(distance))
-                st.session_state.distance_manual = False
+
                 st.success("Saved!")
                 st.rerun()
 
