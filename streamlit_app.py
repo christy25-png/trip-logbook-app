@@ -16,10 +16,8 @@ from reportlab.pdfgen import canvas
 st.set_page_config(page_title="Trip Logbook", layout="centered")
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-SUPABASE_SERVICE_ROLE_KEY = st.secrets.get(
-    "SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
-SUPABASE_KEY_FALLBACK = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))  # optional
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
+SUPABASE_KEY_FALLBACK = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", os.getenv("ADMIN_PIN", ""))
 APP_TITLE = st.secrets.get("APP_TITLE", os.getenv("APP_TITLE", "🚗 Trip Logbook"))
 
@@ -47,6 +45,28 @@ def show_api_error(e: Exception):
 
 
 # =========================
+# STRING NORMALIZATION
+# =========================
+def clean_text(s: str) -> str:
+    """Trim and collapse whitespace (preserves capitalization)."""
+    if not s:
+        return ""
+    return " ".join(str(s).strip().split())
+
+
+def canonical_place(s: str) -> str:
+    """Canonical form used for route distance memory (case/space insensitive)."""
+    return clean_text(s).lower()
+
+
+def normalize_pair(a: str, b: str) -> tuple[str, str]:
+    """Canonical + sorted, so A->B and B->A map to the same record."""
+    a = canonical_place(a)
+    b = canonical_place(b)
+    return (a, b) if a <= b else (b, a)
+
+
+# =========================
 # SUPABASE HELPERS
 # =========================
 def get_periods():
@@ -64,8 +84,8 @@ def get_periods():
         return []
 
 
-def ensure_period(name: str) -> str | None:
-    name = (name or "").strip()
+def ensure_period(name: str):
+    name = clean_text(name)
     if not name:
         return None
     try:
@@ -81,7 +101,7 @@ def ensure_period(name: str) -> str | None:
 
 
 def create_period(name: str):
-    name = (name or "").strip()
+    name = clean_text(name)
     if not name:
         return None
     try:
@@ -129,7 +149,12 @@ def get_places(limit=600):
 
 
 def upsert_place(name: str):
-    name = (name or "").strip()
+    """
+    Safe place insert that NEVER errors on duplicates:
+    - if exists: update is_active
+    - else: insert
+    """
+    name = clean_text(name)
     if not name:
         return
     try:
@@ -143,15 +168,9 @@ def upsert_place(name: str):
         pass
 
 
-def normalize_pair(a: str, b: str) -> tuple[str, str]:
-    a = (a or "").strip()
-    b = (b or "").strip()
-    return (a, b) if a.lower() <= b.lower() else (b, a)
-
-
 def get_route_distance(departure: str, arrival: str) -> float | None:
-    dep = (departure or "").strip()
-    arr = (arrival or "").strip()
+    dep = canonical_place(departure)
+    arr = canonical_place(arrival)
     if not dep or not arr:
         return None
     a, b = normalize_pair(dep, arr)
@@ -173,8 +192,8 @@ def get_route_distance(departure: str, arrival: str) -> float | None:
 
 
 def set_route_distance(departure: str, arrival: str, distance_km: float):
-    dep = (departure or "").strip()
-    arr = (arrival or "").strip()
+    dep = canonical_place(departure)
+    arr = canonical_place(arrival)
     if not dep or not arr:
         return
     a, b = normalize_pair(dep, arr)
@@ -189,7 +208,9 @@ def set_route_distance(departure: str, arrival: str, distance_km: float):
         ).data
         if existing:
             rid = existing[0]["id"]
-            supabase.table("route_distances").update({"distance_km": float(distance_km)}).eq("id", rid).execute()
+            supabase.table("route_distances").update(
+                {"distance_km": float(distance_km), "updated_at": "now()"}
+            ).eq("id", rid).execute()
         else:
             supabase.table("route_distances").insert(
                 {"place_a": a, "place_b": b, "distance_km": float(distance_km)}
@@ -203,10 +224,10 @@ def insert_trip(period_id: str, trip_date: date, car_id: str, departure: str, ar
         "period_id": period_id,
         "trip_date": str(trip_date),
         "car_id": car_id,
-        "departure": departure.strip(),
-        "arrival": arrival.strip(),
+        "departure": clean_text(departure),
+        "arrival": clean_text(arrival),
         "distance_km": float(distance_km),
-        "notes": notes.strip() if notes else None,
+        "notes": clean_text(notes) if notes else None,
     }
     try:
         return supabase.table("trip_entries").insert(payload).execute()
@@ -291,7 +312,7 @@ def update_place(place_id: str, updates: dict):
 
 
 # =========================
-# UI HELPERS
+# EXPORT HELPERS
 # =========================
 def month_range(d: date):
     start = d.replace(day=1)
@@ -391,7 +412,7 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
-# Keys used by widgets (do NOT assign widget return values into these keys)
+# Widget-owned keys (do not assign widget return into these)
 if "dep_choice" not in st.session_state:
     st.session_state.dep_choice = ""
 if "arr_choice" not in st.session_state:
@@ -406,30 +427,56 @@ if "distance_value" not in st.session_state:
 if "distance_manual" not in st.session_state:
     st.session_state.distance_manual = False
 
+# Track route so we can autofill when route changes (even if user edited distance previously)
+if "last_route_key" not in st.session_state:
+    st.session_state.last_route_key = ""
+
 
 def get_dep_value(places_list: list[str]) -> str:
     if st.session_state.dep_choice == PLACE_TYPE_NEW:
-        return (st.session_state.dep_typed or "").strip()
+        return clean_text(st.session_state.dep_typed)
     if st.session_state.dep_choice in places_list:
-        return (st.session_state.dep_choice or "").strip()
-    return (st.session_state.dep_typed or "").strip()
+        return clean_text(st.session_state.dep_choice)
+    return clean_text(st.session_state.dep_typed)
 
 
 def get_arr_value(places_list: list[str]) -> str:
     if st.session_state.arr_choice == PLACE_TYPE_NEW:
-        return (st.session_state.arr_typed or "").strip()
+        return clean_text(st.session_state.arr_typed)
     if st.session_state.arr_choice in places_list:
-        return (st.session_state.arr_choice or "").strip()
-    return (st.session_state.arr_typed or "").strip()
+        return clean_text(st.session_state.arr_choice)
+    return clean_text(st.session_state.arr_typed)
 
 
-def autofill_distance_if_possible(places_list: list[str]):
-    st.session_state.distance_manual = False
-    dep = get_dep_value(places_list)
-    arr = get_arr_value(places_list)
-    d = get_route_distance(dep, arr)
-    if d is not None:
-        st.session_state.distance_value = float(d)
+def route_key_for_current(places_list: list[str]) -> str:
+    dep = canonical_place(get_dep_value(places_list))
+    arr = canonical_place(get_arr_value(places_list))
+    if not dep or not arr:
+        return ""
+    a, b = normalize_pair(dep, arr)
+    return f"{a}__{b}"
+
+
+def maybe_autofill_distance(places_list: list[str]):
+    """
+    Auto-fill from memory whenever the route changes.
+    This keeps it easy for your dad:
+    - Change dep/arr (or swap) -> distance auto-fills
+    - Dad can still edit distance afterwards
+    """
+    rk = route_key_for_current(places_list)
+    if not rk:
+        return
+
+    if rk != st.session_state.last_route_key:
+        st.session_state.last_route_key = rk
+        st.session_state.distance_manual = False  # new route -> allow autofill
+
+        dep = get_dep_value(places_list)
+        arr = get_arr_value(places_list)
+        mem = get_route_distance(dep, arr)
+        if mem is not None:
+            st.session_state.distance_value = float(mem)
 
 
 def on_distance_change():
@@ -463,7 +510,7 @@ with tabs[0]:
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
-    # Period selection (default to current year)
+    # Period selection (default current year)
     st.subheader("Period (logbook)")
     current_year_name = str(date.today().year)
     ensure_period(current_year_name)
@@ -509,7 +556,6 @@ with tabs[0]:
     dep_options = places + [PLACE_TYPE_NEW]
     arr_options = places + [PLACE_TYPE_NEW]
 
-    # keep current selections valid
     if st.session_state.dep_choice and st.session_state.dep_choice not in dep_options:
         st.session_state.dep_choice = PLACE_TYPE_NEW
     if st.session_state.arr_choice and st.session_state.arr_choice not in arr_options:
@@ -526,7 +572,7 @@ with tabs[0]:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        # Swap button (works)
+        # Swap button
         swap_col1, swap_col2 = st.columns([1, 3])
         with swap_col1:
             if st.button("↔ Swap", use_container_width=True):
@@ -538,26 +584,26 @@ with tabs[0]:
                     st.session_state.arr_typed,
                     st.session_state.dep_typed,
                 )
-                autofill_distance_if_possible(places)
+                # route changed -> autofill
+                maybe_autofill_distance(places)
                 st.rerun()
         with swap_col2:
             st.caption("Swap Departure and Arrival")
 
-        # IMPORTANT FIX:
-        # Do NOT assign widget return values into st.session_state keys.
+        # Departure / Arrival (autofill when route changes)
         st.selectbox(
             "Departure",
             dep_options,
             index=dep_options.index(st.session_state.dep_choice) if st.session_state.dep_choice in dep_options else 0,
             key="dep_choice",
-            on_change=lambda: autofill_distance_if_possible(places),
+            on_change=lambda: maybe_autofill_distance(places),
         )
         if st.session_state.dep_choice == PLACE_TYPE_NEW:
             st.text_input(
                 "Departure (type)",
                 value=st.session_state.dep_typed,
                 key="dep_typed",
-                on_change=lambda: autofill_distance_if_possible(places),
+                on_change=lambda: maybe_autofill_distance(places),
             )
 
         st.selectbox(
@@ -565,24 +611,18 @@ with tabs[0]:
             arr_options,
             index=arr_options.index(st.session_state.arr_choice) if st.session_state.arr_choice in arr_options else 0,
             key="arr_choice",
-            on_change=lambda: autofill_distance_if_possible(places),
+            on_change=lambda: maybe_autofill_distance(places),
         )
         if st.session_state.arr_choice == PLACE_TYPE_NEW:
             st.text_input(
                 "Arrival (type)",
                 value=st.session_state.arr_typed,
                 key="arr_typed",
-                on_change=lambda: autofill_distance_if_possible(places),
+                on_change=lambda: maybe_autofill_distance(places),
             )
 
-        # auto-fill distance if possible (only when user hasn't manually edited)
-        if not st.session_state.distance_manual:
-            dep_now = get_dep_value(places)
-            arr_now = get_arr_value(places)
-            if dep_now and arr_now:
-                mem = get_route_distance(dep_now, arr_now)
-                if mem is not None:
-                    st.session_state.distance_value = float(mem)
+        # Ensure we try autofill on first render when both are already chosen
+        maybe_autofill_distance(places)
 
         col3, col4 = st.columns(2)
         with col3:
@@ -608,20 +648,22 @@ with tabs[0]:
                 st.error("Please fill in Departure and Arrival.")
             else:
                 insert_trip(selected_period_id, trip_date, car_id, departure, arrival, float(distance), notes)
+
                 upsert_place(departure)
                 upsert_place(arrival)
+
+                # Update memory for BOTH directions
                 set_route_distance(departure, arrival, float(distance))
 
-                # after saving, allow next route to autofill again
+                # After save, next route change will autofill again
                 st.session_state.distance_manual = False
 
                 st.success("Saved!")
                 st.rerun()
 
-    # ======= The rest of your app (Trips, Manage, Export, Admin) remains the same style =======
-
     st.divider()
 
+    # ----- Range controls -----
     colr1, colr2 = st.columns([1, 2])
     with colr1:
         range_mode = st.radio("Range", ["This month", "Custom"], horizontal=False)
@@ -649,6 +691,7 @@ with tabs[0]:
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
     st.metric("Total distance", f"{total_km:.1f} km")
 
+    # Trips table
     st.subheader("Trips")
     df_export = make_export_df(df, car_id_to_label)
     if df_export.empty:
@@ -658,6 +701,7 @@ with tabs[0]:
 
     st.divider()
 
+    # Manage trips table
     st.subheader("Manage trips (edit / delete)")
     if df.empty:
         st.info("Nothing to manage for this selection.")
@@ -713,8 +757,8 @@ with tabs[0]:
                         updates["car_id"] = car_label_to_id.get(str(new_row["car_label"]))
 
                     for field in ["departure", "arrival", "notes"]:
-                        nv = "" if pd.isna(new_row[field]) else str(new_row[field]).strip()
-                        ov = "" if pd.isna(old_row[field]) else str(old_row[field]).strip()
+                        nv = clean_text(new_row[field])
+                        ov = clean_text(old_row[field])
                         if nv != ov:
                             updates[field] = nv
 
@@ -747,6 +791,7 @@ with tabs[0]:
                     st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
 
+    # Export at bottom + filename
     st.divider()
     st.subheader("Export")
 
@@ -754,10 +799,9 @@ with tabs[0]:
     file_base = st.text_input("File name", value=default_name, help="Used for CSV / XLSX / PDF.")
     file_base = (file_base or "trips").strip().replace("/", "-")
 
-    if df_export.empty:
-        export_df = pd.DataFrame(columns=["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"])
-    else:
-        export_df = df_export
+    export_df = df_export if not df_export.empty else pd.DataFrame(
+        columns=["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]
+    )
 
     csv_bytes = export_csv_bytes(export_df)
     xlsx_bytes = export_xlsx_bytes(export_df)
@@ -817,8 +861,8 @@ with tabs[1]:
                     pid = str(n["id"])
 
                     updates = {}
-                    if str(n["name"]).strip() != str(o["name"]).strip():
-                        updates["name"] = str(n["name"]).strip()
+                    if clean_text(n["name"]) != clean_text(o["name"]):
+                        updates["name"] = clean_text(n["name"])
                     if bool(n["is_active"]) != bool(o["is_active"]):
                         updates["is_active"] = bool(n["is_active"])
 
