@@ -4,6 +4,7 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 from reportlab.lib.pagesizes import A4
@@ -70,6 +71,259 @@ def parse_year_from_period_name(name: str) -> int:
     if name.isdigit() and len(name) == 4:
         return int(name)
     return date.today().year
+
+
+# =========================
+# WHEEL PICKER (Distance)
+# =========================
+def distance_wheel_picker(
+    label: str,
+    key: str,
+    value: float,
+    min_value: float = 1.0,
+    max_value: float = 200.0,
+    step: float = 0.5,
+    height_px: int = 220,
+) -> float:
+    """
+    iOS-style wheel picker using an HTML component.
+    Returns the currently picked float.
+
+    It simulates "infinite" by repeating the list 3x and snapping back to the middle copy.
+    """
+    # build values (as strings) for stable matching
+    values = []
+    v = min_value
+    # avoid float drift
+    steps = int(round((max_value - min_value) / step))
+    for i in range(steps + 1):
+        values.append(round(min_value + i * step, 1))
+
+    # clamp/round incoming value
+    if value is None:
+        value = min_value
+    value = float(value)
+    value = max(min_value, min(max_value, value))
+    value = round(value / step) * step
+    value = round(value, 1)
+
+    # We repeat the list 3 times to do a wrap effect
+    values_3x = values + values + values
+    base_len = len(values)
+
+    # find the index in the *middle* copy that matches current value
+    try:
+        idx_in_base = values.index(value)
+    except ValueError:
+        idx_in_base = 0
+    initial_index = base_len + idx_in_base  # middle block
+
+    # HTML + JS (uses streamlit-component-lib bridge)
+    # This is the standard way to send values from HTML back to Streamlit.
+    options_html = "\n".join(
+        f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
+        for val in values_3x
+    )
+
+    # Some styling to look like iOS wheel
+    html = f"""
+    <html>
+      <head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
+        <style>
+          :root {{
+            --h: 34px; /* row height */
+            --w: 100%;
+          }}
+          body {{
+            margin: 0;
+            padding: 0;
+            background: transparent;
+            color: #eaeaea;
+            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+          }}
+          .wrap {{
+            width: var(--w);
+          }}
+          .label {{
+            font-size: 14px;
+            margin: 0 0 8px 0;
+            color: #eaeaea;
+          }}
+          .wheel {{
+            position: relative;
+            height: {height_px}px;
+            border-radius: 12px;
+            border: 1px solid rgba(255,255,255,0.15);
+            background: rgba(255,255,255,0.04);
+            overflow: hidden;
+          }}
+          .list {{
+            height: 100%;
+            overflow-y: scroll;
+            scrollbar-width: thin;
+            scroll-snap-type: y mandatory;
+            padding: calc({height_px}px/2 - var(--h)/2) 0;
+          }}
+          .item {{
+            height: var(--h);
+            line-height: var(--h);
+            text-align: center;
+            font-size: 18px;
+            letter-spacing: 0.2px;
+            scroll-snap-align: center;
+            color: rgba(234,234,234,0.70);
+            user-select: none;
+          }}
+          .item.active {{
+            color: rgba(234,234,234,1.0);
+            font-weight: 700;
+          }}
+          .center-highlight {{
+            position: absolute;
+            left: 10px;
+            right: 10px;
+            top: 50%;
+            transform: translateY(-50%);
+            height: var(--h);
+            border-radius: 10px;
+            background: rgba(255,255,255,0.10);
+            border: 1px solid rgba(255,255,255,0.18);
+            pointer-events: none;
+          }}
+          .fade-top, .fade-bottom {{
+            position: absolute;
+            left: 0;
+            right: 0;
+            height: 45px;
+            pointer-events: none;
+          }}
+          .fade-top {{
+            top: 0;
+            background: linear-gradient(to bottom, rgba(18,18,18,0.90), rgba(18,18,18,0));
+          }}
+          .fade-bottom {{
+            bottom: 0;
+            background: linear-gradient(to top, rgba(18,18,18,0.90), rgba(18,18,18,0));
+          }}
+        </style>
+      </head>
+      <body>
+        <div class="wrap">
+          <div class="label">{label}</div>
+          <div class="wheel">
+            <div class="fade-top"></div>
+            <div class="fade-bottom"></div>
+            <div class="center-highlight"></div>
+            <div id="list" class="list">
+              {options_html}
+            </div>
+          </div>
+        </div>
+
+        <script>
+          const list = document.getElementById("list");
+          const rowH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--h'));
+          const baseLen = {base_len};
+          const initialIndex = {initial_index};
+
+          function setActiveByIndex(idx) {{
+            const items = list.querySelectorAll(".item");
+            items.forEach(el => el.classList.remove("active"));
+            if (items[idx]) items[idx].classList.add("active");
+          }}
+
+          function nearestIndex() {{
+            // scrollTop + center offset
+            const center = list.scrollTop + (list.clientHeight / 2);
+            const idx = Math.round((center - (rowH / 2)) / rowH);
+            return Math.max(0, Math.min(idx, list.children.length - 1));
+          }}
+
+          function valueAtIndex(idx) {{
+            const el = list.children[idx];
+            if (!el) return null;
+            return parseFloat(el.dataset.value);
+          }}
+
+          let debounce = null;
+
+          function sendValue(val) {{
+            if (window.Streamlit) {{
+              window.Streamlit.setComponentValue(val);
+            }}
+          }}
+
+          function snapAndWrap() {{
+            const idx = nearestIndex();
+            const val = valueAtIndex(idx);
+            if (val === null) return;
+
+            // snap to exact row
+            const targetScroll = idx * rowH - (list.clientHeight/2 - rowH/2);
+            list.scrollTo({{ top: targetScroll, behavior: "auto" }});
+
+            // wrap logic:
+            // if we are in first third -> jump to middle third
+            // if in last third -> jump to middle third
+            let idxIn3 = idx;
+            if (idxIn3 < baseLen) {{
+              idxIn3 = idxIn3 + baseLen;
+            }} else if (idxIn3 >= baseLen*2) {{
+              idxIn3 = idxIn3 - baseLen;
+            }}
+
+            const val2 = valueAtIndex(idxIn3);
+            const targetScroll2 = idxIn3 * rowH - (list.clientHeight/2 - rowH/2);
+            if (Math.abs(targetScroll2 - list.scrollTop) > 1) {{
+              list.scrollTo({{ top: targetScroll2, behavior: "auto" }});
+            }}
+
+            setActiveByIndex(idxIn3);
+            sendValue(val2);
+          }}
+
+          // initial positioning
+          function init() {{
+            const targetScroll = initialIndex * rowH - (list.clientHeight/2 - rowH/2);
+            list.scrollTo({{ top: targetScroll, behavior: "auto" }});
+            setActiveByIndex(initialIndex);
+            sendValue(valueAtIndex(initialIndex));
+            if (window.Streamlit) window.Streamlit.setFrameHeight({height_px + 40});
+          }}
+
+          list.addEventListener("scroll", () => {{
+            if (debounce) clearTimeout(debounce);
+            debounce = setTimeout(snapAndWrap, 140);
+          }});
+
+          // click to select
+          list.addEventListener("click", (e) => {{
+            const item = e.target.closest(".item");
+            if (!item) return;
+            const items = Array.from(list.children);
+            const idx = items.indexOf(item);
+            const targetScroll = idx * rowH - (list.clientHeight/2 - rowH/2);
+            list.scrollTo({{ top: targetScroll, behavior: "smooth" }});
+            if (debounce) clearTimeout(debounce);
+            debounce = setTimeout(snapAndWrap, 180);
+          }});
+
+          window.addEventListener("load", init);
+        </script>
+      </body>
+    </html>
+    """
+
+    picked = components.html(html, height=height_px + 40, key=key)
+    # Streamlit returns the JS value here
+    if picked is None:
+        return value
+    try:
+        return float(picked)
+    except Exception:
+        return value
 
 
 # =========================
@@ -614,15 +868,10 @@ def maybe_autofill_distance(places_list: list[str]):
         arr = get_arr_value(places_list)
         mem = get_route_distance(dep, arr)
         if mem is not None:
-            # slider is 1..200 in steps of 0.5; clamp
             mem = float(mem)
             mem = max(1.0, min(200.0, mem))
-            mem = round(mem * 2) / 2.0
+            mem = round(mem * 2) / 2.0  # nearest 0.5
             st.session_state.distance_value = mem
-
-
-def on_distance_change():
-    st.session_state.distance_manual = True
 
 
 # =========================
@@ -630,7 +879,6 @@ def on_distance_change():
 # =========================
 st.title(APP_TITLE)
 tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
-
 
 # ---------- TRIP LOG TAB ----------
 with tabs[0]:
@@ -651,6 +899,7 @@ with tabs[0]:
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
+    # Period selection (default current year)
     st.subheader("Period (logbook)")
     current_year_name = str(date.today().year)
     ensure_period(current_year_name)
@@ -678,6 +927,7 @@ with tabs[0]:
             else:
                 st.error("Type a name first (e.g. 2027).")
 
+    # Cars
     cars = get_cars()
     if not cars:
         st.error("No active cars found. Add your cars in the 'cars' table.")
@@ -691,6 +941,7 @@ with tabs[0]:
         car_id_to_label[c["id"]] = label
     car_labels = list(car_label_to_id.keys())
 
+    # Places
     places = get_places()
     dep_options = places + [PLACE_TYPE_NEW]
     arr_options = places + [PLACE_TYPE_NEW]
@@ -700,6 +951,7 @@ with tabs[0]:
     if st.session_state.arr_choice and st.session_state.arr_choice not in arr_options:
         st.session_state.arr_choice = PLACE_TYPE_NEW
 
+    # ----- Add trip -----
     st.subheader("Add a trip")
     with st.container(border=True):
         col1, col2 = st.columns(2)
@@ -760,24 +1012,25 @@ with tabs[0]:
 
         col3, col4 = st.columns(2)
         with col3:
-            # SLIDER 1..200 step 0.5 (dad-friendly)
-            slider_value = float(st.session_state.distance_value)
-            slider_value = max(1.0, min(200.0, slider_value))
-            slider_value = round(slider_value * 2) / 2.0  # to nearest 0.5
-
-            distance = st.slider(
-                "Distance (km)",
+            # iOS-style wheel picker
+            picked = distance_wheel_picker(
+                label="Distance (km)",
+                key="distance_wheel",
+                value=float(st.session_state.distance_value),
                 min_value=1.0,
                 max_value=200.0,
-                value=slider_value,
                 step=0.5,
-                key="distance_slider",
-                on_change=on_distance_change,
+                height_px=220,
             )
+            # If user scrolls wheel, it updates immediately
+            if float(picked) != float(st.session_state.distance_value):
+                st.session_state.distance_value = float(picked)
+                st.session_state.distance_manual = True
+
+            distance = float(st.session_state.distance_value)
+
         with col4:
             notes = st.text_input("Notes (optional)")
-
-        st.session_state.distance_value = float(distance)
 
         if st.button("✅ Save trip", use_container_width=True):
             departure = get_dep_value(places)
@@ -796,6 +1049,7 @@ with tabs[0]:
 
     st.divider()
 
+    # ----- View mode -----
     st.subheader("View trips")
     view_mode = st.radio(
         "View mode",
@@ -863,6 +1117,7 @@ with tabs[0]:
 
     st.divider()
 
+    # Manage trips
     st.subheader("Manage trips (edit / delete)")
     if df.empty:
         st.info("Nothing to manage for this selection.")
@@ -936,6 +1191,7 @@ with tabs[0]:
                         upsert_place(dep_now)
                         upsert_place(arr_now)
                         set_route_distance(dep_now, arr_now, float(dist_now))
+
                         changes += 1
 
                 st.success(f"Saved edits on {changes} trip(s).")
@@ -951,6 +1207,7 @@ with tabs[0]:
                     st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
 
+    # Export at bottom
     st.divider()
     st.subheader("Export")
 
