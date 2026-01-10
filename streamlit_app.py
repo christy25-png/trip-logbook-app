@@ -91,11 +91,9 @@ def distance_wheel_picker_html(
     Uses top/bottom spacer divs (instead of padding) so snapping math is exact.
     Compatibility: does NOT pass key= into components.html().
     """
-    # Build value list
     steps = int(round((max_value - min_value) / step))
     values = [round(min_value + i * step, 1) for i in range(steps + 1)]
 
-    # clamp & round incoming value
     if value is None:
         value = min_value
     value = float(value)
@@ -103,7 +101,6 @@ def distance_wheel_picker_html(
     value = round(value / step) * step
     value = round(value, 1)
 
-    # Repeat 3x for "infinite" feel
     values_3x = values + values + values
     base_len = len(values)
 
@@ -112,11 +109,9 @@ def distance_wheel_picker_html(
     except ValueError:
         idx_in_base = 0
 
-    # We will have spacer as first child => item index offset = +1
     initial_index_in_middle = base_len + idx_in_base
     initial_child_index = 1 + initial_index_in_middle  # +1 because spacer is child 0
 
-    # HTML options
     options_html = "\n".join(
         f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
         for val in values_3x
@@ -131,7 +126,7 @@ def distance_wheel_picker_html(
         <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
         <style>
           :root {{
-            --h: 28px; /* row height */
+            --h: 28px;
           }}
           body {{
             margin: 0;
@@ -233,7 +228,6 @@ def distance_wheel_picker_html(
           }}
 
           function scrollTopForItem(itemIndex) {{
-            // With spacers, perfect centered mapping becomes scrollTop = itemIndex * rowH
             return itemIndex * rowH;
           }}
 
@@ -259,10 +253,8 @@ def distance_wheel_picker_html(
             const items = itemsOnly();
             if (!items[idx]) return;
 
-            // snap exactly
             list.scrollTo({{ top: scrollTopForItem(idx), behavior: "auto" }});
 
-            // wrap logic: idx is within 3x list (0..3*baseLen-1)
             let idx3 = idx;
             if (idx3 < baseLen) {{
               idx3 = idx3 + baseLen;
@@ -277,7 +269,7 @@ def distance_wheel_picker_html(
           }}
 
           function init() {{
-            const initialItemIndex = initialChildIndex - 1; // child index -> item index
+            const initialItemIndex = initialChildIndex - 1;
             list.scrollTo({{ top: scrollTopForItem(initialItemIndex), behavior: "auto" }});
             setActiveItem(initialItemIndex);
             sendValue(valueAtItem(initialItemIndex));
@@ -813,10 +805,13 @@ if "dep_typed" not in st.session_state:
 if "arr_typed" not in st.session_state:
     st.session_state.arr_typed = ""
 
+# Distance states
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
 if "distance_candidate" not in st.session_state:
     st.session_state.distance_candidate = float(st.session_state.distance_value)
+if "distance_live" not in st.session_state:
+    st.session_state.distance_live = float(st.session_state.distance_value)
 if "distance_confirmed" not in st.session_state:
     st.session_state.distance_confirmed = True
 
@@ -864,6 +859,7 @@ def maybe_autofill_distance(places_list: list[str]):
             mem = round(mem * 2) / 2.0  # nearest 0.5
             st.session_state.distance_value = mem
             st.session_state.distance_candidate = mem
+            st.session_state.distance_live = mem
             st.session_state.distance_confirmed = True
 
 
@@ -1007,12 +1003,7 @@ with tabs[0]:
 
         col3, col4 = st.columns(2)
         with col3:
-            # Compact "input field" look + tap to open picker (with Confirm)
             st.caption("Distance (km)")
-
-            # Keep candidate in sync if needed
-            if "distance_candidate" not in st.session_state:
-                st.session_state.distance_candidate = float(st.session_state.distance_value)
 
             confirmed_badge = "✅" if st.session_state.get("distance_confirmed", True) else "🟡"
             st.markdown(
@@ -1045,29 +1036,36 @@ with tabs[0]:
             def picker_body():
                 picked = distance_wheel_picker_html(
                     key="distance_wheel",
-                    value=float(st.session_state.distance_candidate),
+                    value=float(st.session_state.distance_live),
                     min_value=1.0,
                     max_value=200.0,
                     step=0.5,
                     height_px=160,
                 )
 
-                if float(picked) != float(st.session_state.distance_candidate):
-                    st.session_state.distance_candidate = float(picked)
-                    st.session_state.distance_confirmed = False
+                if picked is not None:
+                    try:
+                        picked_f = float(picked)
+                        if picked_f != float(st.session_state.distance_live):
+                            st.session_state.distance_live = picked_f
+                            st.session_state.distance_confirmed = False
+                    except Exception:
+                        pass
 
-                st.caption(f"Selected: **{float(st.session_state.distance_candidate):.1f} km**")
+                st.caption(f"Selected: **{float(st.session_state.distance_live):.1f} km**")
 
                 cA, cB = st.columns([1, 1])
                 with cA:
                     if st.button("✅ Use this distance", use_container_width=True, key="confirm_distance"):
-                        st.session_state.distance_value = float(st.session_state.distance_candidate)
+                        st.session_state.distance_value = float(st.session_state.distance_live)
+                        st.session_state.distance_candidate = float(st.session_state.distance_live)
                         st.session_state.distance_confirmed = True
                         st.success(f"Distance set to {float(st.session_state.distance_value):.1f} km")
                         st.rerun()
 
                 with cB:
                     if st.button("↩️ Cancel", use_container_width=True, key="cancel_distance"):
+                        st.session_state.distance_live = float(st.session_state.distance_value)
                         st.session_state.distance_candidate = float(st.session_state.distance_value)
                         st.session_state.distance_confirmed = True
                         st.info("No changes made.")
@@ -1086,7 +1084,6 @@ with tabs[0]:
             notes = st.text_input("Notes (optional)")
 
         if st.button("✅ Save trip", use_container_width=True):
-            # Optional safety: require confirmation before saving
             if not st.session_state.get("distance_confirmed", True):
                 st.error("Please confirm the distance first (tap 'Use this distance').")
                 st.stop()
