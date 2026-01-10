@@ -74,30 +74,28 @@ def parse_year_from_period_name(name: str) -> int:
 
 
 # =========================
-# WHEEL PICKER (Distance)
+# iOS-LIKE WHEEL PICKER (Distance)
+# - compact by default
+# - tap/click to open wheel
 # =========================
-def distance_wheel_picker(
-    label: str,
+def distance_wheel_picker_html(
     key: str,
     value: float,
     min_value: float = 1.0,
     max_value: float = 200.0,
     step: float = 0.5,
-    height_px: int = 220,
+    height_px: int = 160,
 ) -> float:
     """
     iOS-style wheel picker using an HTML component.
-    Simulates "infinite" by repeating the list 3x and snapping back to the middle copy.
-
-    IMPORTANT: We do NOT pass key= to components.html() because some Streamlit versions
-    don't support it. Instead, we embed the key into element IDs in the HTML.
+    Returns float. Uses wrap effect by repeating list 3x.
+    Compatibility: does NOT pass key= into components.html().
     """
     values = []
     steps = int(round((max_value - min_value) / step))
     for i in range(steps + 1):
         values.append(round(min_value + i * step, 1))
 
-    # clamp & round
     if value is None:
         value = min_value
     value = float(value)
@@ -112,7 +110,7 @@ def distance_wheel_picker(
         idx_in_base = values.index(value)
     except ValueError:
         idx_in_base = 0
-    initial_index = base_len + idx_in_base  # middle block
+    initial_index = base_len + idx_in_base
 
     options_html = "\n".join(
         f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
@@ -128,7 +126,7 @@ def distance_wheel_picker(
         <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
         <style>
           :root {{
-            --h: 34px;
+            --h: 28px;  /* row height */
           }}
           body {{
             margin: 0;
@@ -136,11 +134,6 @@ def distance_wheel_picker(
             background: transparent;
             color: #eaeaea;
             font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-          }}
-          .label {{
-            font-size: 14px;
-            margin: 0 0 8px 0;
-            color: #eaeaea;
           }}
           .wheel {{
             position: relative;
@@ -161,14 +154,15 @@ def distance_wheel_picker(
             height: var(--h);
             line-height: var(--h);
             text-align: center;
-            font-size: 18px;
+            font-size: 15px;
             scroll-snap-align: center;
             color: rgba(234,234,234,0.70);
             user-select: none;
           }}
           .item.active {{
             color: rgba(234,234,234,1.0);
-            font-weight: 700;
+            font-weight: 800;
+            font-size: 17px;
           }}
           .center-highlight {{
             position: absolute;
@@ -186,7 +180,7 @@ def distance_wheel_picker(
             position: absolute;
             left: 0;
             right: 0;
-            height: 45px;
+            height: 36px;
             pointer-events: none;
           }}
           .fade-top {{
@@ -200,15 +194,12 @@ def distance_wheel_picker(
         </style>
       </head>
       <body>
-        <div>
-          <div class="label">{label}</div>
-          <div class="wheel">
-            <div class="fade-top"></div>
-            <div class="fade-bottom"></div>
-            <div class="center-highlight"></div>
-            <div id="{list_id}" class="list">
-              {options_html}
-            </div>
+        <div class="wheel">
+          <div class="fade-top"></div>
+          <div class="fade-bottom"></div>
+          <div class="center-highlight"></div>
+          <div id="{list_id}" class="list">
+            {options_html}
           </div>
         </div>
 
@@ -274,7 +265,7 @@ def distance_wheel_picker(
             list.scrollTo({{ top: targetScroll, behavior: "auto" }});
             setActiveByIndex(initialIndex);
             sendValue(valueAtIndex(initialIndex));
-            if (window.Streamlit) window.Streamlit.setFrameHeight({height_px + 40});
+            if (window.Streamlit) window.Streamlit.setFrameHeight({height_px});
           }}
 
           list.addEventListener("scroll", () => {{
@@ -299,19 +290,7 @@ def distance_wheel_picker(
     </html>
     """
 
-    # IMPORTANT: no key= here (older Streamlit versions error)
-    picked = components.html(html, height=height_px + 40)
-
-    if picked is None:
-        return value
-    try:
-        return float(picked)
-    except Exception:
-        return value
-
-
-    picked = components.html(html, height=height_px + 40, key=key)
-    # Streamlit returns the JS value here
+    picked = components.html(html, height=height_px)
     if picked is None:
         return value
     try:
@@ -874,8 +853,10 @@ def maybe_autofill_distance(places_list: list[str]):
 st.title(APP_TITLE)
 tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
 
+
 # ---------- TRIP LOG TAB ----------
 with tabs[0]:
+    # Admin unlock
     with st.expander("🔐 Admin mode"):
         if not ADMIN_PIN:
             st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin features.")
@@ -1006,20 +987,59 @@ with tabs[0]:
 
         col3, col4 = st.columns(2)
         with col3:
-            # iOS-style wheel picker
-            picked = distance_wheel_picker(
-                label="Distance (km)",
-                key="distance_wheel",
-                value=float(st.session_state.distance_value),
-                min_value=1.0,
-                max_value=200.0,
-                step=0.5,
-                height_px=220,
+            # Compact "input field" look + tap to open picker
+            st.caption("Distance (km)")
+            st.markdown(
+                f"""
+                <div style="
+                    display:flex;
+                    align-items:center;
+                    justify-content:space-between;
+                    padding:10px 12px;
+                    border-radius:12px;
+                    border:1px solid rgba(255,255,255,0.15);
+                    background: rgba(255,255,255,0.04);
+                    ">
+                    <div style="font-size:18px; font-weight:800;">
+                        {float(st.session_state.distance_value):.1f} km
+                    </div>
+                    <div style="opacity:0.7; font-size:14px;">
+                        ✏️ edit
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True
             )
-            # If user scrolls wheel, it updates immediately
-            if float(picked) != float(st.session_state.distance_value):
-                st.session_state.distance_value = float(picked)
-                st.session_state.distance_manual = True
+
+            has_popover = hasattr(st, "popover")
+            if has_popover:
+                with st.popover("Change distance", use_container_width=True):
+                    picked = distance_wheel_picker_html(
+                        key="distance_wheel",
+                        value=float(st.session_state.distance_value),
+                        min_value=1.0,
+                        max_value=200.0,
+                        step=0.5,
+                        height_px=160,  # smaller wheel
+                    )
+                    if float(picked) != float(st.session_state.distance_value):
+                        st.session_state.distance_value = float(picked)
+                        st.session_state.distance_manual = True
+                    st.caption("Scroll to select. Tap outside to close.")
+            else:
+                with st.expander("Change distance"):
+                    picked = distance_wheel_picker_html(
+                        key="distance_wheel",
+                        value=float(st.session_state.distance_value),
+                        min_value=1.0,
+                        max_value=200.0,
+                        step=0.5,
+                        height_px=160,
+                    )
+                    if float(picked) != float(st.session_state.distance_value):
+                        st.session_state.distance_value = float(picked)
+                        st.session_state.distance_manual = True
+                    st.caption("Scroll to select. Close this section when done.")
 
             distance = float(st.session_state.distance_value)
 
