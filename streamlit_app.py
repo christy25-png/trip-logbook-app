@@ -4,7 +4,6 @@ from datetime import date
 
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 from reportlab.lib.pagesizes import A4
@@ -74,237 +73,15 @@ def parse_year_from_period_name(name: str) -> int:
 
 
 # =========================
-# iOS-LIKE WHEEL PICKER (Distance) — FIXED SNAPPING
+# DISTANCE OPTIONS (1..200, step 0.5)
+# On iPhone this opens a native iOS wheel picker.
 # =========================
-def distance_wheel_picker_html(
-    key: str,
-    value: float,
-    min_value: float = 1.0,
-    max_value: float = 200.0,
-    step: float = 0.5,
-    height_px: int = 160,
-) -> float:
-    """
-    iOS-style wheel picker using an HTML component.
-    FIXED snapping: it will not stop between values.
+def build_distance_options(min_km=1.0, max_km=200.0, step=0.5) -> list[float]:
+    n = int(round((max_km - min_km) / step))
+    return [round(min_km + i * step, 1) for i in range(n + 1)]
 
-    Uses top/bottom spacer divs (instead of padding) so snapping math is exact.
-    Compatibility: does NOT pass key= into components.html().
-    """
-    steps = int(round((max_value - min_value) / step))
-    values = [round(min_value + i * step, 1) for i in range(steps + 1)]
 
-    if value is None:
-        value = min_value
-    value = float(value)
-    value = max(min_value, min(max_value, value))
-    value = round(value / step) * step
-    value = round(value, 1)
-
-    values_3x = values + values + values
-    base_len = len(values)
-
-    try:
-        idx_in_base = values.index(value)
-    except ValueError:
-        idx_in_base = 0
-
-    initial_index_in_middle = base_len + idx_in_base
-    initial_child_index = 1 + initial_index_in_middle  # +1 because spacer is child 0
-
-    options_html = "\n".join(
-        f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
-        for val in values_3x
-    )
-
-    list_id = f"list_{key}"
-
-    html = f"""
-    <html>
-      <head>
-        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
-        <style>
-          :root {{
-            --h: 28px;
-          }}
-          body {{
-            margin: 0;
-            padding: 0;
-            background: transparent;
-            color: #eaeaea;
-            font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-          }}
-          .wheel {{
-            position: relative;
-            height: {height_px}px;
-            border-radius: 12px;
-            border: 1px solid rgba(255,255,255,0.15);
-            background: rgba(255,255,255,0.04);
-            overflow: hidden;
-          }}
-          .list {{
-            height: 100%;
-            overflow-y: scroll;
-            scroll-snap-type: y mandatory;
-            -webkit-overflow-scrolling: touch;
-            scrollbar-width: thin;
-          }}
-          .spacer {{
-            height: calc({height_px}px/2 - var(--h)/2);
-            scroll-snap-align: start;
-          }}
-          .item {{
-            height: var(--h);
-            line-height: var(--h);
-            text-align: center;
-            font-size: 15px;
-            scroll-snap-align: center;
-            color: rgba(234,234,234,0.70);
-            user-select: none;
-          }}
-          .item.active {{
-            color: rgba(234,234,234,1.0);
-            font-weight: 800;
-            font-size: 17px;
-          }}
-          .center-highlight {{
-            position: absolute;
-            left: 10px;
-            right: 10px;
-            top: 50%;
-            transform: translateY(-50%);
-            height: var(--h);
-            border-radius: 10px;
-            background: rgba(255,255,255,0.10);
-            border: 1px solid rgba(255,255,255,0.18);
-            pointer-events: none;
-          }}
-          .fade-top, .fade-bottom {{
-            position: absolute;
-            left: 0;
-            right: 0;
-            height: 36px;
-            pointer-events: none;
-          }}
-          .fade-top {{
-            top: 0;
-            background: linear-gradient(to bottom, rgba(18,18,18,0.90), rgba(18,18,18,0));
-          }}
-          .fade-bottom {{
-            bottom: 0;
-            background: linear-gradient(to top, rgba(18,18,18,0.90), rgba(18,18,18,0));
-          }}
-        </style>
-      </head>
-
-      <body>
-        <div class="wheel">
-          <div class="fade-top"></div>
-          <div class="fade-bottom"></div>
-          <div class="center-highlight"></div>
-
-          <div id="{list_id}" class="list">
-            <div class="spacer"></div>
-            {options_html}
-            <div class="spacer"></div>
-          </div>
-        </div>
-
-        <script>
-          const list = document.getElementById("{list_id}");
-          const rowH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--h'));
-          const baseLen = {base_len};
-          const initialChildIndex = {initial_child_index};
-
-          function itemsOnly() {{
-            return Array.from(list.children).slice(1, list.children.length - 1);
-          }}
-
-          function setActiveItem(itemIndex) {{
-            const items = itemsOnly();
-            items.forEach(el => el.classList.remove("active"));
-            if (items[itemIndex]) items[itemIndex].classList.add("active");
-          }}
-
-          function scrollTopForItem(itemIndex) {{
-            return itemIndex * rowH;
-          }}
-
-          function nearestItemIndex() {{
-            return Math.max(0, Math.min(Math.round(list.scrollTop / rowH), itemsOnly().length - 1));
-          }}
-
-          function valueAtItem(itemIndex) {{
-            const items = itemsOnly();
-            const el = items[itemIndex];
-            if (!el) return null;
-            return parseFloat(el.dataset.value);
-          }}
-
-          function sendValue(val) {{
-            if (window.Streamlit) window.Streamlit.setComponentValue(val);
-          }}
-
-          let debounce = null;
-
-          function snapAndWrap() {{
-            const idx = nearestItemIndex();
-            const items = itemsOnly();
-            if (!items[idx]) return;
-
-            list.scrollTo({{ top: scrollTopForItem(idx), behavior: "auto" }});
-
-            let idx3 = idx;
-            if (idx3 < baseLen) {{
-              idx3 = idx3 + baseLen;
-            }} else if (idx3 >= baseLen * 2) {{
-              idx3 = idx3 - baseLen;
-            }}
-
-            const val2 = valueAtItem(idx3);
-            list.scrollTo({{ top: scrollTopForItem(idx3), behavior: "auto" }});
-            setActiveItem(idx3);
-            sendValue(val2);
-          }}
-
-          function init() {{
-            const initialItemIndex = initialChildIndex - 1;
-            list.scrollTo({{ top: scrollTopForItem(initialItemIndex), behavior: "auto" }});
-            setActiveItem(initialItemIndex);
-            sendValue(valueAtItem(initialItemIndex));
-            if (window.Streamlit) window.Streamlit.setFrameHeight({height_px});
-          }}
-
-          list.addEventListener("scroll", () => {{
-            if (debounce) clearTimeout(debounce);
-            debounce = setTimeout(snapAndWrap, 120);
-          }});
-
-          list.addEventListener("click", (e) => {{
-            const item = e.target.closest(".item");
-            if (!item) return;
-            const items = itemsOnly();
-            const idx = items.indexOf(item);
-            if (idx < 0) return;
-            list.scrollTo({{ top: scrollTopForItem(idx), behavior: "smooth" }});
-            if (debounce) clearTimeout(debounce);
-            debounce = setTimeout(snapAndWrap, 220);
-          }});
-
-          window.addEventListener("load", init);
-        </script>
-      </body>
-    </html>
-    """
-
-    picked = components.html(html, height=height_px)
-    if picked is None:
-        return value
-    try:
-        return float(picked)
-    except Exception:
-        return value
+DISTANCE_OPTIONS = build_distance_options(1.0, 200.0, 0.5)
 
 
 # =========================
@@ -808,12 +585,10 @@ if "arr_typed" not in st.session_state:
 # Distance states
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
-if "distance_candidate" not in st.session_state:
-    st.session_state.distance_candidate = float(st.session_state.distance_value)
-if "distance_live" not in st.session_state:
-    st.session_state.distance_live = float(st.session_state.distance_value)
 if "distance_confirmed" not in st.session_state:
     st.session_state.distance_confirmed = True
+if "distance_pick" not in st.session_state:
+    st.session_state.distance_pick = float(st.session_state.distance_value)
 
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
@@ -858,8 +633,7 @@ def maybe_autofill_distance(places_list: list[str]):
             mem = max(1.0, min(200.0, mem))
             mem = round(mem * 2) / 2.0  # nearest 0.5
             st.session_state.distance_value = mem
-            st.session_state.distance_candidate = mem
-            st.session_state.distance_live = mem
+            st.session_state.distance_pick = mem
             st.session_state.distance_confirmed = True
 
 
@@ -1033,50 +807,49 @@ with tabs[0]:
 
             has_popover = hasattr(st, "popover")
 
-            def picker_body():
-                picked = distance_wheel_picker_html(
-                    key="distance_wheel",
-                    value=float(st.session_state.distance_live),
-                    min_value=1.0,
-                    max_value=200.0,
-                    step=0.5,
-                    height_px=160,
+            def distance_picker_ui():
+                # Make sure the picker defaults to current value
+                if st.session_state.distance_pick not in DISTANCE_OPTIONS:
+                    st.session_state.distance_pick = float(st.session_state.distance_value)
+
+                idx = DISTANCE_OPTIONS.index(float(st.session_state.distance_pick))
+
+                picked = st.selectbox(
+                    "Pick distance",
+                    options=DISTANCE_OPTIONS,
+                    index=idx,
+                    format_func=lambda x: f"{x:.1f} km",
+                    key="distance_pick_selectbox",
                 )
 
-                if picked is not None:
-                    try:
-                        picked_f = float(picked)
-                        if picked_f != float(st.session_state.distance_live):
-                            st.session_state.distance_live = picked_f
-                            st.session_state.distance_confirmed = False
-                    except Exception:
-                        pass
+                st.caption(f"Selected: **{float(picked):.1f} km**")
 
-                st.caption(f"Selected: **{float(st.session_state.distance_live):.1f} km**")
-
-                cA, cB = st.columns([1, 1])
+                cA, cB = st.columns(2)
                 with cA:
                     if st.button("✅ Use this distance", use_container_width=True, key="confirm_distance"):
-                        st.session_state.distance_value = float(st.session_state.distance_live)
-                        st.session_state.distance_candidate = float(st.session_state.distance_live)
+                        st.session_state.distance_value = float(picked)
+                        st.session_state.distance_pick = float(picked)
                         st.session_state.distance_confirmed = True
-                        st.success(f"Distance set to {float(st.session_state.distance_value):.1f} km")
+                        st.success(f"Distance set to {float(picked):.1f} km")
                         st.rerun()
 
                 with cB:
                     if st.button("↩️ Cancel", use_container_width=True, key="cancel_distance"):
-                        st.session_state.distance_live = float(st.session_state.distance_value)
-                        st.session_state.distance_candidate = float(st.session_state.distance_value)
+                        st.session_state.distance_pick = float(st.session_state.distance_value)
                         st.session_state.distance_confirmed = True
                         st.info("No changes made.")
                         st.rerun()
 
+                # mark as not confirmed if user changed pick but didn't confirm
+                if float(picked) != float(st.session_state.distance_value):
+                    st.session_state.distance_confirmed = False
+
             if has_popover:
                 with st.popover("Change distance", use_container_width=True):
-                    picker_body()
+                    distance_picker_ui()
             else:
                 with st.expander("Change distance"):
-                    picker_body()
+                    distance_picker_ui()
 
             distance = float(st.session_state.distance_value)
 
@@ -1098,7 +871,6 @@ with tabs[0]:
                 upsert_place(departure)
                 upsert_place(arrival)
                 set_route_distance(departure, arrival, float(distance))
-
                 st.success("Saved!")
                 st.rerun()
 
