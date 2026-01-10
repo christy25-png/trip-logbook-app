@@ -196,9 +196,6 @@ def deactivate_places(place_ids: list[str]):
 
 
 def hard_delete_places(place_ids: list[str]):
-    """
-    Will fail if trips reference a place (FK restrict). Good for debugging if unused.
-    """
     if not place_ids:
         return None
     return safe_execute(
@@ -301,7 +298,7 @@ def fetch_entries(period_id: str, start_date: date, end_date: date, car_id=None,
     return df
 
 
-# ===== Places history =====
+# Places history
 def fetch_places_history(limit=500):
     res = safe_execute(
         supabase.table("places_history")
@@ -323,7 +320,7 @@ def delete_places_history(history_ids: list[str]):
 
 
 # =========================
-# DATE RANGE + GROUPING
+# DATE + EXPORT HELPERS
 # =========================
 def month_range(d: date):
     start = d.replace(day=1)
@@ -364,9 +361,6 @@ def monthly_totals(df: pd.DataFrame) -> pd.DataFrame:
     return totals[["Month", "Total distance (km)"]]
 
 
-# =========================
-# EXPORTS
-# =========================
 def make_export_df(df: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
     if df.empty:
         return df
@@ -426,6 +420,7 @@ def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, tit
         ws_summary.freeze_panes = "A5"
         _autosize_worksheet(ws_summary)
 
+    # Month sheets
     if not df_raw.empty and not df_export.empty:
         d = add_month_columns(df_raw)
         work = df_export.copy()
@@ -568,10 +563,16 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
 
 
 # =========================
-# SESSION STATE
+# SESSION STATE (SWAP-SAFE)
 # =========================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+
+# The values we control (NOT widget keys)
+if "dep_value" not in st.session_state:
+    st.session_state.dep_value = None
+if "arr_value" not in st.session_state:
+    st.session_state.arr_value = None
 
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
@@ -598,7 +599,6 @@ def maybe_autofill_distance(dep_id: str, arr_id: str):
 st.title(APP_TITLE)
 tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
 
-
 # ---------- TRIP LOG ----------
 with tabs[0]:
     with st.expander("🔐 Admin mode"):
@@ -607,18 +607,17 @@ with tabs[0]:
         pin = st.text_input("Enter admin PIN", type="password", key="admin_pin_input")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Unlock admin", use_container_width=True, key="unlock_admin_btn"):
+            if st.button("Unlock admin", use_container_width=True):
                 if ADMIN_PIN and pin == ADMIN_PIN:
                     st.session_state.is_admin = True
                     st.success("Admin mode enabled.")
                 else:
                     st.error("Wrong PIN.")
         with c2:
-            if st.button("Lock admin", use_container_width=True, key="lock_admin_btn"):
+            if st.button("Lock admin", use_container_width=True):
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
-    # Period selection (default current year)
     st.subheader("Period (logbook)")
     current_year_name = str(date.today().year)
     ensure_period(current_year_name)
@@ -634,17 +633,15 @@ with tabs[0]:
 
     colp1, colp2 = st.columns([2, 1])
     with colp1:
-        selected_period_name = st.selectbox("Choose period", period_names, index=default_index, key="period_select")
+        selected_period_name = st.selectbox("Choose period", period_names, index=default_index)
         selected_period_id = period_name_to_id[selected_period_name]
     with colp2:
-        new_period_name = st.text_input("New period name", placeholder="e.g. 2027", key="new_period_name")
-        if st.button("➕ Add period", use_container_width=True, key="add_period_btn"):
+        new_period_name = st.text_input("New period name", placeholder="e.g. 2027")
+        if st.button("➕ Add period", use_container_width=True):
             if new_period_name.strip():
                 create_period(new_period_name.strip())
-                st.success("Period added.")
                 st.rerun()
 
-    # Cars
     cars = get_cars()
     if not cars:
         st.error("No active cars found. Add your cars in Supabase table: cars.")
@@ -658,22 +655,20 @@ with tabs[0]:
         car_id_to_label[c["id"]] = label
     car_labels = list(car_label_to_id.keys())
 
-    # Places
     places = get_places(active_only=True)
     place_label_to_id = {p["label"]: p["id"] for p in places}
     place_id_to_address = {p["id"]: p["address"] for p in places}
     place_labels = list(place_label_to_id.keys())
 
-    # Add trip
     st.subheader("Add a trip")
     with st.container(border=True):
         with st.expander("➕ Add a place (name + address)"):
             cA, cB = st.columns(2)
             with cA:
-                new_place_label = st.text_input("Place name (easy label)", placeholder="e.g. Client Breda", key="add_place_label")
+                new_place_label = st.text_input("Place name (easy label)", key="new_place_label")
             with cB:
-                new_place_address = st.text_input("Full address", placeholder="e.g. Street 1, Breda, NL", key="add_place_address")
-            if st.button("Save place", use_container_width=True, key="save_place_btn"):
+                new_place_address = st.text_input("Full address", key="new_place_address")
+            if st.button("Save place", use_container_width=True):
                 created = create_place(new_place_label, new_place_address)
                 if created:
                     st.success("Place saved.")
@@ -685,29 +680,53 @@ with tabs[0]:
 
         col1, col2 = st.columns(2)
         with col1:
-            trip_date = st.date_input("Date", value=date.today(), key="trip_date_input")
+            trip_date = st.date_input("Date", value=date.today())
             st.caption(f"Day: **{trip_date.strftime('%A')}**")
         with col2:
-            car_label = st.selectbox("Car", car_labels, key="car_select")
+            car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        # IMPORTANT: Swap fix uses widget values dep_select/arr_select directly
+        # init controlled values once
+        if st.session_state.dep_value is None:
+            st.session_state.dep_value = place_labels[0]
+        if st.session_state.arr_value is None:
+            st.session_state.arr_value = place_labels[0] if len(place_labels) == 1 else place_labels[1]
+
+        # keep valid if places list changed
+        if st.session_state.dep_value not in place_labels:
+            st.session_state.dep_value = place_labels[0]
+        if st.session_state.arr_value not in place_labels:
+            st.session_state.arr_value = place_labels[0] if len(place_labels) == 1 else place_labels[1]
+
         colD, colS, colA = st.columns([1, 1, 1])
         with colD:
-            dep_label = st.selectbox("Departure (place name)", place_labels, key="dep_select")
+            dep_label = st.selectbox(
+                "Departure (place name)",
+                place_labels,
+                index=place_labels.index(st.session_state.dep_value),
+                key="dep_widget",
+            )
         with colA:
-            arr_label = st.selectbox("Arrival (place name)", place_labels, key="arr_select")
+            arr_label = st.selectbox(
+                "Arrival (place name)",
+                place_labels,
+                index=place_labels.index(st.session_state.arr_value),
+                key="arr_widget",
+            )
         with colS:
             if st.button("↔ Swap", use_container_width=True, key="swap_btn"):
-                # Swap CURRENT widget values safely
-                current_dep = st.session_state.get("dep_select")
-                current_arr = st.session_state.get("arr_select")
-                st.session_state["dep_select"] = current_arr
-                st.session_state["arr_select"] = current_dep
+                st.session_state.dep_value, st.session_state.arr_value = (
+                    st.session_state.arr_value,
+                    st.session_state.dep_value,
+                )
                 st.rerun()
 
-        dep_id = place_label_to_id.get(st.session_state.get("dep_select"))
-        arr_id = place_label_to_id.get(st.session_state.get("arr_select"))
+        # sync controlled values from widgets
+        st.session_state.dep_value = dep_label
+        st.session_state.arr_value = arr_label
+
+        dep_id = place_label_to_id.get(st.session_state.dep_value)
+        arr_id = place_label_to_id.get(st.session_state.arr_value)
 
         if dep_id and arr_id:
             maybe_autofill_distance(dep_id, arr_id)
@@ -721,17 +740,16 @@ with tabs[0]:
                 step=0.5,
                 value=float(st.session_state.distance_value),
                 key="distance_value",
-                help="Autofills from memory if known. You can still change it.",
             )
         with col4:
-            notes = st.text_input("Notes (optional)", key="notes_input")
+            notes = st.text_input("Notes (optional)")
 
         if dep_id:
             st.caption(f"Departure address: **{place_id_to_address.get(dep_id,'')}**")
         if arr_id:
             st.caption(f"Arrival address: **{place_id_to_address.get(arr_id,'')}**")
 
-        if st.button("✅ Save trip", use_container_width=True, key="save_trip_btn"):
+        if st.button("✅ Save trip", use_container_width=True):
             if not dep_id or not arr_id:
                 st.error("Please choose both Departure and Arrival.")
             elif dep_id == arr_id:
@@ -746,20 +764,18 @@ with tabs[0]:
                 st.rerun()
 
     st.divider()
-
-    # View mode default: All months
     st.subheader("View trips")
+
     view_mode = st.radio(
         "View mode",
         ["One month", "All months (year)", "Custom range"],
         horizontal=True,
         index=1,
-        key="view_mode_radio",
     )
 
     year_for_period = parse_year_from_period_name(selected_period_name)
     if view_mode == "One month":
-        pick = st.date_input("Pick a day in the month", value=date.today(), key="view_month_pick")
+        pick = st.date_input("Pick a day in the month", value=date.today())
         start_date, end_date = month_range(pick)
     elif view_mode == "All months (year)":
         start_date, end_date = year_range(year_for_period)
@@ -767,15 +783,15 @@ with tabs[0]:
     else:
         cA, cB = st.columns(2)
         with cA:
-            start_date = st.date_input("Start", value=date(year_for_period, 1, 1), key="range_start")
+            start_date = st.date_input("Start", value=date(year_for_period, 1, 1))
         with cB:
-            end_date = st.date_input("End", value=date.today(), key="range_end")
+            end_date = st.date_input("End", value=date.today())
 
     colf1, colf2 = st.columns(2)
     with colf1:
-        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels, key="car_filter_select")
+        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
     with colf2:
-        search_text = st.text_input("Search (addresses/notes)", placeholder="type to search...", key="search_text")
+        search_text = st.text_input("Search (addresses/notes)", placeholder="type to search...")
 
     filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
     df = fetch_entries(selected_period_id, start_date, end_date, car_id=filter_car_id, search_text=search_text)
@@ -794,12 +810,11 @@ with tabs[0]:
     else:
         st.dataframe(df_export, use_container_width=True, hide_index=True)
 
-    # Export bottom
     st.divider()
     st.subheader("Export")
 
     default_name = f"{selected_period_name}_{start_date}_to_{end_date}"
-    file_base = st.text_input("File name", value=default_name, key="export_name")
+    file_base = st.text_input("File name", value=default_name)
     file_base = (file_base or "trips").strip().replace("/", "-")
 
     export_df = df_export if not df_export.empty else pd.DataFrame(
@@ -839,37 +854,34 @@ with tabs[1]:
     if not all_places:
         st.info("No places yet.")
     else:
-        df_places = pd.DataFrame(all_places)
-        df_places = df_places[["id", "label", "address", "is_active", "created_at"]].copy()
-        df_places["DELETE"] = False  # used for selecting rows
+        df_places = pd.DataFrame(all_places)[["id", "label", "address", "is_active", "created_at"]].copy()
+        df_places["SELECT"] = False
 
-        edited_places = st.data_editor(
+        edited = st.data_editor(
             df_places,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
             column_config={
-                "DELETE": st.column_config.CheckboxColumn("Select"),
-                "label": st.column_config.TextColumn("Place label"),
+                "SELECT": st.column_config.CheckboxColumn("Select"),
+                "label": st.column_config.TextColumn("Label"),
                 "address": st.column_config.TextColumn("Address"),
                 "is_active": st.column_config.CheckboxColumn("Active"),
                 "id": st.column_config.TextColumn("ID", disabled=True),
                 "created_at": st.column_config.TextColumn("Created", disabled=True),
             },
             disabled=["id", "created_at"],
-            key="admin_places_editor",
+            key="places_admin_editor",
         )
 
-        cA, cB, cC = st.columns(3)
-
-        with cA:
+        c1, c2, c3 = st.columns(3)
+        with c1:
             if st.button("💾 Save edits", use_container_width=True):
                 changed = 0
-                for i in range(len(edited_places)):
-                    n = edited_places.iloc[i]
+                for i in range(len(edited)):
+                    n = edited.iloc[i]
                     o = df_places.iloc[i]
                     pid = str(n["id"])
-
                     updates = {}
                     if clean_text(n["label"]) != clean_text(o["label"]):
                         updates["label"] = clean_text(n["label"])
@@ -877,77 +889,58 @@ with tabs[1]:
                         updates["address"] = clean_text(n["address"])
                     if bool(n["is_active"]) != bool(o["is_active"]):
                         updates["is_active"] = bool(n["is_active"])
-
                     if updates:
                         update_place(pid, updates)
                         changed += 1
-
                 st.success(f"Updated {changed} place(s).")
                 st.rerun()
 
-        with cB:
+        with c2:
             if st.button("🚫 Deactivate selected (safe)", use_container_width=True):
-                selected = edited_places.loc[edited_places["DELETE"] == True, "id"].astype(str).tolist()
-                if not selected:
-                    st.info("No places selected.")
-                else:
-                    deactivate_places(selected)
-                    st.success(f"Deactivated {len(selected)} place(s).")
-                    st.rerun()
+                selected = edited.loc[edited["SELECT"] == True, "id"].astype(str).tolist()
+                deactivate_places(selected)
+                st.success(f"Deactivated {len(selected)} place(s).")
+                st.rerun()
 
-        with cC:
+        with c3:
             if st.button("🧨 Hard delete selected (unused only)", use_container_width=True):
-                selected = edited_places.loc[edited_places["DELETE"] == True, "id"].astype(str).tolist()
-                if not selected:
-                    st.info("No places selected.")
-                else:
-                    # may fail if trips reference it — we show the error
-                    res = hard_delete_places(selected)
-                    if res:
-                        st.success(f"Deleted {len(selected)} place(s).")
-                    st.rerun()
+                selected = edited.loc[edited["SELECT"] == True, "id"].astype(str).tolist()
+                hard_delete_places(selected)  # may fail if referenced; error shown
+                st.rerun()
 
     st.divider()
-
     st.subheader("Places history (backup)")
-    st.caption("This logs every INSERT / UPDATE / DELETE on places. You can delete history rows if you want.")
-
     hist = fetch_places_history(limit=500)
     if hist.empty:
         st.info("No history yet.")
     else:
-        # small friendly view
-        hist_view = hist.copy()
-        hist_view["DELETE"] = False
-        hist_view = hist_view[["DELETE", "changed_at", "action", "place_id", "id"]].copy()
+        view = hist[["id", "changed_at", "action", "place_id"]].copy()
+        view["SELECT"] = False
+        view = view[["SELECT", "changed_at", "action", "place_id", "id"]]
 
-        hist_edited = st.data_editor(
-            hist_view,
+        edited_hist = st.data_editor(
+            view,
             use_container_width=True,
             hide_index=True,
             num_rows="fixed",
             column_config={
-                "DELETE": st.column_config.CheckboxColumn("Select"),
+                "SELECT": st.column_config.CheckboxColumn("Select"),
                 "changed_at": st.column_config.TextColumn("When"),
                 "action": st.column_config.TextColumn("Action"),
                 "place_id": st.column_config.TextColumn("Place ID"),
                 "id": st.column_config.TextColumn("History ID", disabled=True),
             },
             disabled=["id"],
-            key="history_editor",
+            key="places_history_editor",
         )
 
         c1, c2 = st.columns(2)
         with c1:
             if st.button("🗑️ Delete selected history rows", use_container_width=True):
-                ids = hist_edited.loc[hist_edited["DELETE"] == True, "id"].astype(str).tolist()
-                if not ids:
-                    st.info("No history rows selected.")
-                else:
-                    delete_places_history(ids)
-                    st.success(f"Deleted {len(ids)} history rows.")
-                    st.rerun()
-
+                ids = edited_hist.loc[edited_hist["SELECT"] == True, "id"].astype(str).tolist()
+                delete_places_history(ids)
+                st.success(f"Deleted {len(ids)} history rows.")
+                st.rerun()
         with c2:
-            with st.expander("View full history details (old/new JSON)"):
+            with st.expander("Show full history (old/new JSON)"):
                 st.dataframe(hist, use_container_width=True, hide_index=True)
