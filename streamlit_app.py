@@ -24,7 +24,7 @@ SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
 SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 SUPABASE_KEY_FALLBACK = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", os.getenv("ADMIN_PIN", ""))
-APP_TITLE = st.secrets.get("APP_TITLE", os.getenv("APP_TITLE", "🚗 Trip Logbook"))
+APP_TITLE = st.secrets.get("APP_TITLE", os.getenv("APP_TITLE", "Trip Logbook"))
 
 if not SUPABASE_URL:
     st.error("Missing SUPABASE_URL in Streamlit secrets.")
@@ -630,13 +630,13 @@ def maybe_autofill_distance(places_list: list[str]):
 # MAIN UI
 # =========================
 st.title(APP_TITLE)
-tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
+tabs = st.tabs(["Trip Log", "Admin"])
 
 
 # ---------- TRIP LOG TAB ----------
 with tabs[0]:
     # Admin unlock
-    with st.expander("🔐 Admin mode"):
+    with st.expander("Admin mode"):
         if not ADMIN_PIN:
             st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin features.")
         pin = st.text_input("Enter admin PIN", type="password", key="admin_pin_input")
