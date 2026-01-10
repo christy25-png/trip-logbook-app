@@ -73,18 +73,6 @@ def parse_year_from_period_name(name: str) -> int:
 
 
 # =========================
-# DISTANCE OPTIONS (1..200, step 0.5)
-# On iPhone this opens a native iOS wheel picker.
-# =========================
-def build_distance_options(min_km=1.0, max_km=200.0, step=0.5) -> list[float]:
-    n = int(round((max_km - min_km) / step))
-    return [round(min_km + i * step, 1) for i in range(n + 1)]
-
-
-DISTANCE_OPTIONS = build_distance_options(1.0, 200.0, 0.5)
-
-
-# =========================
 # SUPABASE HELPERS
 # =========================
 def get_periods():
@@ -582,13 +570,13 @@ if "dep_typed" not in st.session_state:
 if "arr_typed" not in st.session_state:
     st.session_state.arr_typed = ""
 
-# Distance states
+# Distance states (reliable)
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
+if "distance_temp" not in st.session_state:
+    st.session_state.distance_temp = float(st.session_state.distance_value)
 if "distance_confirmed" not in st.session_state:
     st.session_state.distance_confirmed = True
-if "distance_pick" not in st.session_state:
-    st.session_state.distance_pick = float(st.session_state.distance_value)
 
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
@@ -630,11 +618,21 @@ def maybe_autofill_distance(places_list: list[str]):
         mem = get_route_distance(dep, arr)
         if mem is not None:
             mem = float(mem)
-            mem = max(1.0, min(200.0, mem))
+            mem = max(0.0, min(200.0, mem))
             mem = round(mem * 2) / 2.0  # nearest 0.5
             st.session_state.distance_value = mem
-            st.session_state.distance_pick = mem
+            st.session_state.distance_temp = mem
             st.session_state.distance_confirmed = True
+
+
+def apply_distance():
+    st.session_state.distance_value = float(st.session_state.distance_temp)
+    st.session_state.distance_confirmed = True
+
+
+def cancel_distance():
+    st.session_state.distance_temp = float(st.session_state.distance_value)
+    st.session_state.distance_confirmed = True
 
 
 # =========================
@@ -650,17 +648,17 @@ with tabs[0]:
     with st.expander("🔐 Admin mode"):
         if not ADMIN_PIN:
             st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin features.")
-        pin = st.text_input("Enter admin PIN", type="password")
+        pin = st.text_input("Enter admin PIN", type="password", key="admin_pin_input")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Unlock admin", use_container_width=True):
+            if st.button("Unlock admin", use_container_width=True, key="unlock_admin_btn"):
                 if ADMIN_PIN and pin == ADMIN_PIN:
                     st.session_state.is_admin = True
                     st.success("Admin mode enabled.")
                 else:
                     st.error("Wrong PIN.")
         with c2:
-            if st.button("Lock admin", use_container_width=True):
+            if st.button("Lock admin", use_container_width=True, key="lock_admin_btn"):
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
@@ -680,11 +678,11 @@ with tabs[0]:
 
     colp1, colp2 = st.columns([2, 1])
     with colp1:
-        selected_period_name = st.selectbox("Choose period", period_names, index=default_index)
+        selected_period_name = st.selectbox("Choose period", period_names, index=default_index, key="period_select")
         selected_period_id = period_name_to_id[selected_period_name]
     with colp2:
-        new_period_name = st.text_input("New period name", placeholder="e.g. 2027")
-        if st.button("➕ Add period", use_container_width=True):
+        new_period_name = st.text_input("New period name", placeholder="e.g. 2027", key="new_period_name")
+        if st.button("➕ Add period", use_container_width=True, key="add_period_btn"):
             if new_period_name.strip():
                 create_period(new_period_name.strip())
                 st.success("Period added.")
@@ -721,15 +719,15 @@ with tabs[0]:
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
-            trip_date = st.date_input("Date", value=date.today())
+            trip_date = st.date_input("Date", value=date.today(), key="trip_date_input")
             st.caption(f"Day: **{trip_date.strftime('%A')}**")
         with col2:
-            car_label = st.selectbox("Car", car_labels)
+            car_label = st.selectbox("Car", car_labels, key="car_select")
             car_id = car_label_to_id[car_label]
 
         swap_col1, swap_col2 = st.columns([1, 3])
         with swap_col1:
-            if st.button("↔ Swap", use_container_width=True):
+            if st.button("↔ Swap", use_container_width=True, key="swap_btn"):
                 st.session_state.dep_choice, st.session_state.arr_choice = (
                     st.session_state.arr_choice,
                     st.session_state.dep_choice,
@@ -776,6 +774,10 @@ with tabs[0]:
         maybe_autofill_distance(places)
 
         col3, col4 = st.columns(2)
+
+        # =========================
+        # ✅ RELIABLE CHANGE DISTANCE
+        # =========================
         with col3:
             st.caption("Distance (km)")
 
@@ -807,56 +809,56 @@ with tabs[0]:
 
             has_popover = hasattr(st, "popover")
 
-            def distance_picker_ui():
-                # Make sure the picker defaults to current value
-                if st.session_state.distance_pick not in DISTANCE_OPTIONS:
-                    st.session_state.distance_pick = float(st.session_state.distance_value)
+            def distance_editor():
+                # Always start temp from current value when opening
+                if st.session_state.distance_temp is None:
+                    st.session_state.distance_temp = float(st.session_state.distance_value)
 
-                idx = DISTANCE_OPTIONS.index(float(st.session_state.distance_pick))
-
-                picked = st.selectbox(
-                    "Pick distance",
-                    options=DISTANCE_OPTIONS,
-                    index=idx,
-                    format_func=lambda x: f"{x:.1f} km",
-                    key="distance_pick_selectbox",
+                st.number_input(
+                    "Set distance",
+                    min_value=0.0,
+                    max_value=200.0,
+                    step=0.5,
+                    value=float(st.session_state.distance_temp),
+                    key="distance_temp",
+                    help="Use 0.5 increments",
                 )
 
-                st.caption(f"Selected: **{float(picked):.1f} km**")
+                st.caption(f"Selected: **{float(st.session_state.distance_temp):.1f} km**")
 
                 cA, cB = st.columns(2)
                 with cA:
-                    if st.button("✅ Use this distance", use_container_width=True, key="confirm_distance"):
-                        st.session_state.distance_value = float(picked)
-                        st.session_state.distance_pick = float(picked)
-                        st.session_state.distance_confirmed = True
-                        st.success(f"Distance set to {float(picked):.1f} km")
-                        st.rerun()
-
+                    st.button(
+                        "✅ Use this distance",
+                        use_container_width=True,
+                        key="use_distance_btn",
+                        on_click=apply_distance,
+                    )
                 with cB:
-                    if st.button("↩️ Cancel", use_container_width=True, key="cancel_distance"):
-                        st.session_state.distance_pick = float(st.session_state.distance_value)
-                        st.session_state.distance_confirmed = True
-                        st.info("No changes made.")
-                        st.rerun()
+                    st.button(
+                        "↩️ Cancel",
+                        use_container_width=True,
+                        key="cancel_distance_btn",
+                        on_click=cancel_distance,
+                    )
 
-                # mark as not confirmed if user changed pick but didn't confirm
-                if float(picked) != float(st.session_state.distance_value):
+                # If temp differs from current, show unconfirmed badge
+                if float(st.session_state.distance_temp) != float(st.session_state.distance_value):
                     st.session_state.distance_confirmed = False
 
             if has_popover:
                 with st.popover("Change distance", use_container_width=True):
-                    distance_picker_ui()
+                    distance_editor()
             else:
                 with st.expander("Change distance"):
-                    distance_picker_ui()
+                    distance_editor()
 
             distance = float(st.session_state.distance_value)
 
         with col4:
-            notes = st.text_input("Notes (optional)")
+            notes = st.text_input("Notes (optional)", key="notes_input")
 
-        if st.button("✅ Save trip", use_container_width=True):
+        if st.button("✅ Save trip", use_container_width=True, key="save_trip_btn"):
             if not st.session_state.get("distance_confirmed", True):
                 st.error("Please confirm the distance first (tap 'Use this distance').")
                 st.stop()
@@ -881,13 +883,14 @@ with tabs[0]:
     view_mode = st.radio(
         "View mode",
         ["One month", "All months (year)", "Custom range"],
-        horizontal=True
+        horizontal=True,
+        key="view_mode_radio",
     )
 
     year_for_period = parse_year_from_period_name(selected_period_name)
 
     if view_mode == "One month":
-        pick = st.date_input("Pick a day in the month", value=date.today())
+        pick = st.date_input("Pick a day in the month", value=date.today(), key="view_month_pick")
         start_date, end_date = month_range(pick)
     elif view_mode == "All months (year)":
         start_date, end_date = year_range(year_for_period)
@@ -895,15 +898,15 @@ with tabs[0]:
     else:
         cA, cB = st.columns(2)
         with cA:
-            start_date = st.date_input("Start", value=date(year_for_period, 1, 1))
+            start_date = st.date_input("Start", value=date(year_for_period, 1, 1), key="range_start")
         with cB:
-            end_date = st.date_input("End", value=date.today())
+            end_date = st.date_input("End", value=date.today(), key="range_end")
 
     colf1, colf2 = st.columns(2)
     with colf1:
-        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
+        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels, key="car_filter_select")
     with colf2:
-        search_text = st.text_input("Search (departure/arrival/notes)", placeholder="type to search...")
+        search_text = st.text_input("Search (departure/arrival/notes)", placeholder="type to search...", key="search_text")
 
     filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
 
@@ -971,7 +974,7 @@ with tabs[0]:
                 "DELETE": st.column_config.CheckboxColumn("Delete?"),
                 "trip_date": st.column_config.DateColumn("Date"),
                 "car_label": st.column_config.SelectboxColumn("Car", options=car_labels),
-                "distance_km": st.column_config.NumberColumn("Distance (km)", min_value=0.0, step=0.1),
+                "distance_km": st.column_config.NumberColumn("Distance (km)", min_value=0.0, step=0.5),
                 "notes": st.column_config.TextColumn("Notes"),
                 "id": st.column_config.TextColumn("ID", disabled=True),
             },
@@ -981,7 +984,7 @@ with tabs[0]:
 
         b1, b2 = st.columns(2)
         with b1:
-            if st.button("💾 Save edits", use_container_width=True):
+            if st.button("💾 Save edits", use_container_width=True, key="save_edits_btn"):
                 changes = 0
                 for i in range(len(edited)):
                     new_row = edited.iloc[i]
@@ -1025,7 +1028,7 @@ with tabs[0]:
                 st.rerun()
 
         with b2:
-            if st.button("🗑️ Delete selected", use_container_width=True):
+            if st.button("🗑️ Delete selected", use_container_width=True, key="delete_selected_btn"):
                 to_delete = edited.loc[edited["DELETE"] == True, "id"].astype(str).tolist()
                 if not to_delete:
                     st.info("No trips selected.")
@@ -1039,7 +1042,7 @@ with tabs[0]:
     st.subheader("Export")
 
     default_name = f"{selected_period_name}_{start_date}_to_{end_date}"
-    file_base = st.text_input("File name", value=default_name, help="Used for CSV / XLSX / PDF.")
+    file_base = st.text_input("File name", value=default_name, help="Used for CSV / XLSX / PDF.", key="export_name")
     file_base = (file_base or "trips").strip().replace("/", "-")
 
     export_df = df_export if not df_export.empty else pd.DataFrame(
@@ -1076,9 +1079,9 @@ with tabs[1]:
 
         add_col1, add_col2 = st.columns([3, 1])
         with add_col1:
-            new_place = st.text_input("Add a new place", placeholder="Type a place name (e.g. Amsterdam)")
+            new_place = st.text_input("Add a new place", placeholder="Type a place name (e.g. Amsterdam)", key="admin_new_place")
         with add_col2:
-            if st.button("➕ Add", use_container_width=True):
+            if st.button("➕ Add", use_container_width=True, key="admin_add_place_btn"):
                 if clean_text(new_place):
                     upsert_place(new_place)
                     st.success("Place added.")
@@ -1086,7 +1089,7 @@ with tabs[1]:
                 else:
                     st.error("Type a place name first.")
 
-        place_filter = st.text_input("Search places", placeholder="type to filter...")
+        place_filter = st.text_input("Search places", placeholder="type to filter...", key="admin_place_filter")
         places_df = fetch_places_admin()
 
         if places_df.empty:
@@ -1115,7 +1118,7 @@ with tabs[1]:
                 key="places_editor",
             )
 
-            if st.button("💾 Save place changes", use_container_width=True):
+            if st.button("💾 Save place changes", use_container_width=True, key="admin_save_places_btn"):
                 changed = 0
                 for i in range(len(edited_places)):
                     n = edited_places.iloc[i]
