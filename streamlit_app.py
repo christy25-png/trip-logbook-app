@@ -16,9 +16,7 @@ from reportlab.pdfgen import canvas
 st.set_page_config(page_title="Trip Logbook", layout="centered")
 
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", os.getenv("SUPABASE_URL"))
-SUPABASE_SERVICE_ROLE_KEY = st.secrets.get(
-    "SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-)
+SUPABASE_SERVICE_ROLE_KEY = st.secrets.get("SUPABASE_SERVICE_ROLE_KEY", os.getenv("SUPABASE_SERVICE_ROLE_KEY"))
 SUPABASE_KEY_FALLBACK = st.secrets.get("SUPABASE_KEY", os.getenv("SUPABASE_KEY", ""))  # optional
 ADMIN_PIN = st.secrets.get("ADMIN_PIN", os.getenv("ADMIN_PIN", ""))
 APP_TITLE = st.secrets.get("APP_TITLE", os.getenv("APP_TITLE", "🚗 Trip Logbook"))
@@ -27,7 +25,6 @@ if not SUPABASE_URL:
     st.error("Missing SUPABASE_URL in Streamlit secrets.")
     st.stop()
 
-# Prefer service role key to avoid RLS/policy errors
 SUPABASE_KEY = SUPABASE_SERVICE_ROLE_KEY or SUPABASE_KEY_FALLBACK
 if not SUPABASE_KEY:
     st.error("Missing SUPABASE_SERVICE_ROLE_KEY (recommended) or SUPABASE_KEY in secrets.")
@@ -39,7 +36,7 @@ PLACE_TYPE_NEW = "✍️ Type a new place..."
 
 
 # =========================
-# DEBUG / ERROR DISPLAY
+# ERROR DISPLAY
 # =========================
 def show_api_error(e: Exception):
     st.error("Database request failed.")
@@ -65,12 +62,43 @@ def get_periods():
         return []
 
 
+def ensure_current_year_period() -> str:
+    """
+    Ensure a period exists for current year (e.g. '2026') and return its id.
+    """
+    year_name = str(date.today().year)
+    periods = get_periods()
+    for p in periods:
+        if p.get("name") == year_name:
+            return p["id"]
+
+    # create if missing
+    try:
+        res = supabase.table("periods").insert({"name": year_name, "is_active": True}).execute()
+        rows = res.data or []
+        if rows:
+            return rows[0]["id"]
+    except Exception as e:
+        show_api_error(e)
+
+    # fallback to Default if something goes wrong
+    for p in periods:
+        if p.get("name") == "Default":
+            return p["id"]
+    return periods[0]["id"] if periods else ""
+
+
 def create_period(name: str):
     name = (name or "").strip()
     if not name:
         return None
     try:
-        res = supabase.table("periods").upsert({"name": name, "is_active": True}).execute()
+        # if unique constraint on periods.name exists, insert may fail on duplicates
+        # we do safe check then insert
+        existing = supabase.table("periods").select("id,name").eq("name", name).limit(1).execute().data
+        if existing:
+            return existing[0]
+        res = supabase.table("periods").insert({"name": name, "is_active": True}).execute()
         rows = res.data or []
         return rows[0] if rows else None
     except Exception as e:
@@ -111,13 +139,86 @@ def get_places(limit=600):
 
 
 def upsert_place(name: str):
+    """
+    FIXED FOR GOOD:
+    Avoid relying on upsert conflict behavior.
+    We do:
+      - SELECT by name
+      - if exists: UPDATE is_active=true
+      - else: INSERT
+    This will NEVER crash on duplicates.
+    """
     name = (name or "").strip()
     if not name:
         return
+
     try:
-        supabase.table("places").upsert({"name": name, "is_active": True}).execute()
-    except Exception as e:
-        show_api_error(e)
+        existing = supabase.table("places").select("id").eq("name", name).limit(1).execute().data
+        if existing:
+            pid = existing[0]["id"]
+            supabase.table("places").update({"is_active": True}).eq("id", pid).execute()
+        else:
+            supabase.table("places").insert({"name": name, "is_active": True}).execute()
+    except Exception:
+        # place history should never block saving trips
+        pass
+
+
+def normalize_pair(a: str, b: str) -> tuple[str, str]:
+    a = (a or "").strip()
+    b = (b or "").strip()
+    return (a, b) if a.lower() <= b.lower() else (b, a)
+
+
+def get_route_distance(departure: str, arrival: str):
+    dep = (departure or "").strip()
+    arr = (arrival or "").strip()
+    if not dep or not arr:
+        return None
+    a, b = normalize_pair(dep, arr)
+    try:
+        res = (
+            supabase.table("route_distances")
+            .select("distance_km")
+            .eq("place_a", a)
+            .eq("place_b", b)
+            .limit(1)
+            .execute()
+        )
+        rows = res.data or []
+        if not rows:
+            return None
+        return float(rows[0]["distance_km"])
+    except Exception:
+        return None
+
+
+def set_route_distance(departure: str, arrival: str, distance_km: float):
+    dep = (departure or "").strip()
+    arr = (arrival or "").strip()
+    if not dep or not arr:
+        return
+    a, b = normalize_pair(dep, arr)
+    try:
+        # safe check then insert/update (no need for upsert)
+        existing = (
+            supabase.table("route_distances")
+            .select("id")
+            .eq("place_a", a)
+            .eq("place_b", b)
+            .limit(1)
+            .execute()
+        ).data
+        if existing:
+            rid = existing[0]["id"]
+            supabase.table("route_distances").update({"distance_km": float(distance_km)}).eq("id", rid).execute()
+        else:
+            supabase.table("route_distances").insert(
+                {"place_a": a, "place_b": b, "distance_km": float(distance_km)}
+            ).execute()
+    except Exception:
+        # distance memory should never block saving trips
+        pass
 
 
 def insert_trip(period_id: str, trip_date: date, car_id: str, departure: str, arrival: str, distance_km: float, notes: str):
@@ -215,13 +316,6 @@ def update_place(place_id: str, updates: dict):
 # =========================
 # UI HELPERS
 # =========================
-def place_picker(label: str, places: list[str], key_prefix: str) -> str:
-    choice = st.selectbox(label, options=(places + [PLACE_TYPE_NEW]), key=f"{key_prefix}_choice")
-    if choice == PLACE_TYPE_NEW:
-        return st.text_input(f"{label} (type)", key=f"{key_prefix}_typed").strip()
-    return (choice or "").strip()
-
-
 def month_range(d: date):
     start = d.replace(day=1)
     if start.month == 12:
@@ -265,10 +359,9 @@ def export_xlsx_bytes(df: pd.DataFrame) -> bytes:
 def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     buff = io.BytesIO()
     c = canvas.Canvas(buff, pagesize=A4)
-    w, h = A4
 
     x = 40
-    y = h - 50
+    y = A4[1] - 50
     c.setFont("Helvetica-Bold", 14)
     c.drawString(x, y, title)
 
@@ -299,7 +392,7 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
     for _, row in df.iterrows():
         if y < 60:
             c.showPage()
-            y = h - 50
+            y = A4[1] - 50
             c.setFont("Helvetica", 9)
 
         xx = x
@@ -320,6 +413,42 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
 # =========================
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
+
+# Add-trip widgets state so Swap works
+if "dep_choice" not in st.session_state:
+    st.session_state.dep_choice = ""
+if "arr_choice" not in st.session_state:
+    st.session_state.arr_choice = ""
+if "dep_typed" not in st.session_state:
+    st.session_state.dep_typed = ""
+if "arr_typed" not in st.session_state:
+    st.session_state.arr_typed = ""
+if "distance_value" not in st.session_state:
+    st.session_state.distance_value = 0.0
+
+
+def current_departure_value(places_list: list[str]) -> str:
+    if st.session_state.dep_choice == PLACE_TYPE_NEW:
+        return (st.session_state.dep_typed or "").strip()
+    if st.session_state.dep_choice in places_list:
+        return (st.session_state.dep_choice or "").strip()
+    return (st.session_state.dep_typed or "").strip()
+
+
+def current_arrival_value(places_list: list[str]) -> str:
+    if st.session_state.arr_choice == PLACE_TYPE_NEW:
+        return (st.session_state.arr_typed or "").strip()
+    if st.session_state.arr_choice in places_list:
+        return (st.session_state.arr_choice or "").strip()
+    return (st.session_state.arr_typed or "").strip()
+
+
+def refresh_distance_from_memory(places_list: list[str]):
+    dep = current_departure_value(places_list)
+    arr = current_arrival_value(places_list)
+    d = get_route_distance(dep, arr)
+    if d is not None:
+        st.session_state.distance_value = float(d)
 
 
 # =========================
@@ -349,20 +478,28 @@ with tabs[0]:
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
-    # Period selection
+    # Period selection (default to current year)
     st.subheader("Period (logbook)")
-
     periods = get_periods()
     if not periods:
-        create_period("Default")
+        # ensure current year exists (also creates period if missing)
+        current_year_id = ensure_current_year_period()
+        periods = get_periods()
+    else:
+        current_year_id = ensure_current_year_period()
         periods = get_periods()
 
+    period_names = [p["name"] for p in periods]
     period_name_to_id = {p["name"]: p["id"] for p in periods}
-    period_names = list(period_name_to_id.keys())
+
+    current_year_name = str(date.today().year)
+    default_index = 0
+    if current_year_name in period_names:
+        default_index = period_names.index(current_year_name)
 
     colp1, colp2 = st.columns([2, 1])
     with colp1:
-        selected_period_name = st.selectbox("Choose period", period_names)
+        selected_period_name = st.selectbox("Choose period", period_names, index=default_index)
         selected_period_id = period_name_to_id[selected_period_name]
     with colp2:
         new_period_name = st.text_input("New period name", placeholder="e.g. 2027")
@@ -377,7 +514,7 @@ with tabs[0]:
     # Cars
     cars = get_cars()
     if not cars:
-        st.error("No active cars found. Add Mercedes / Volkswagen in the 'cars' table.")
+        st.error("No active cars found. Add your cars in the 'cars' table.")
         st.stop()
 
     car_label_to_id = {}
@@ -388,135 +525,153 @@ with tabs[0]:
         car_id_to_label[c["id"]] = label
     car_labels = list(car_label_to_id.keys())
 
-    # Places
     places = get_places()
 
-    # Add trip
+    # ----- Add a trip -----
     st.subheader("Add a trip")
     with st.container(border=True):
         col1, col2 = st.columns(2)
         with col1:
             trip_date = st.date_input("Date", value=date.today())
+            st.caption(f"Day: **{trip_date.strftime('%A')}**")
         with col2:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        departure = place_picker("Departure", places, "dep")
-        arrival = place_picker("Arrival", places, "arr")
+        # Swap button
+        swap_col1, swap_col2 = st.columns([1, 3])
+        with swap_col1:
+            if st.button("↔ Swap", use_container_width=True):
+                st.session_state.dep_choice, st.session_state.arr_choice = st.session_state.arr_choice, st.session_state.dep_choice
+                st.session_state.dep_typed, st.session_state.arr_typed = st.session_state.arr_typed, st.session_state.dep_typed
+                refresh_distance_from_memory(places)
+                st.rerun()
+        with swap_col2:
+            st.caption("Swap Departure and Arrival")
+
+        # Departure / Arrival using state (so swap works)
+        dep_options = places + [PLACE_TYPE_NEW]
+        arr_options = places + [PLACE_TYPE_NEW]
+
+        # Keep previously selected values if possible
+        if st.session_state.dep_choice not in dep_options and st.session_state.dep_choice != "":
+            st.session_state.dep_choice = PLACE_TYPE_NEW
+        if st.session_state.arr_choice not in arr_options and st.session_state.arr_choice != "":
+            st.session_state.arr_choice = PLACE_TYPE_NEW
+
+        st.session_state.dep_choice = st.selectbox(
+            "Departure",
+            dep_options,
+            index=dep_options.index(st.session_state.dep_choice) if st.session_state.dep_choice in dep_options else 0,
+            key="dep_choice_widget",
+        )
+        if st.session_state.dep_choice == PLACE_TYPE_NEW:
+            st.session_state.dep_typed = st.text_input("Departure (type)", value=st.session_state.dep_typed, key="dep_typed_widget")
+
+        st.session_state.arr_choice = st.selectbox(
+            "Arrival",
+            arr_options,
+            index=arr_options.index(st.session_state.arr_choice) if st.session_state.arr_choice in arr_options else 0,
+            key="arr_choice_widget",
+        )
+        if st.session_state.arr_choice == PLACE_TYPE_NEW:
+            st.session_state.arr_typed = st.text_input("Arrival (type)", value=st.session_state.arr_typed, key="arr_typed_widget")
+
+        # Auto-fill distance when we have a saved route distance
+        if st.button("🔍 Fill distance from memory", use_container_width=True):
+            refresh_distance_from_memory(places)
+            st.rerun()
 
         col3, col4 = st.columns(2)
         with col3:
-            distance = st.number_input("Distance (km)", min_value=0.0, step=0.1, format="%.1f")
+            distance = st.number_input(
+                "Distance (km)",
+                min_value=0.0,
+                step=0.1,
+                format="%.1f",
+                value=float(st.session_state.distance_value),
+                key="distance_input",
+            )
         with col4:
             notes = st.text_input("Notes (optional)")
 
+        # keep session distance in sync
+        st.session_state.distance_value = float(distance)
+
         if st.button("✅ Save trip", use_container_width=True):
+            departure = current_departure_value(places)
+            arrival = current_arrival_value(places)
+
             if not departure or not arrival:
                 st.error("Please fill in Departure and Arrival.")
             else:
-                insert_trip(selected_period_id, trip_date, car_id, departure, arrival, distance, notes)
+                insert_trip(selected_period_id, trip_date, car_id, departure, arrival, float(distance), notes)
+
+                # Remember places safely (no duplicate error now)
                 upsert_place(departure)
                 upsert_place(arrival)
+
+                # Remember route distance (both directions)
+                set_route_distance(departure, arrival, float(distance))
+
                 st.success("Saved!")
                 st.rerun()
 
     st.divider()
 
-    # Filters
-    st.subheader("Filters")
-    mode = st.radio("Range", ["This month", "Custom range"], horizontal=True)
-    if mode == "This month":
-        pick = st.date_input("Pick any day in the month", value=date.today())
-        start_date, end_date = month_range(pick)
-    else:
-        cA, cB = st.columns(2)
-        with cA:
-            start_date = st.date_input("Start date", value=date(date.today().year, 1, 1))
-        with cB:
-            end_date = st.date_input("End date", value=date.today())
+    # ----- Range controls -----
+    colr1, colr2 = st.columns([1, 2])
+    with colr1:
+        range_mode = st.radio("Range", ["This month", "Custom"], horizontal=False)
+    with colr2:
+        if range_mode == "This month":
+            pick = st.date_input("Month", value=date.today())
+            start_date, end_date = month_range(pick)
+        else:
+            cA, cB = st.columns(2)
+            with cA:
+                start_date = st.date_input("Start", value=date(date.today().year, 1, 1))
+            with cB:
+                end_date = st.date_input("End", value=date.today())
 
-    f1, f2 = st.columns(2)
-    with f1:
-        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
-    with f2:
-        search_text = st.text_input("Search (departure/arrival/notes)", placeholder="type to filter...")
+    colf1, colf2 = st.columns(2)
+    with colf1:
+        filter_car = st.selectbox("Car", ["All cars"] + car_labels)
+    with colf2:
+        search_text = st.text_input("Search", placeholder="type to search...")
 
     filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
 
     df = fetch_entries(selected_period_id, start_date, end_date, car_id=filter_car_id, search_text=search_text)
 
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
-    st.metric("Total distance (selected)", f"{total_km:.1f} km")
+    st.metric("Total distance", f"{total_km:.1f} km")
 
+    # Trips display
+    st.subheader("Trips")
     df_export = make_export_df(df, car_id_to_label)
-
-    st.write("### Trips")
     if df_export.empty:
         st.info("No trips found.")
     else:
         st.dataframe(df_export, use_container_width=True, hide_index=True)
 
-    # Export
-    st.write("### Export")
-    csv_bytes = export_csv_bytes(df_export)
-    xlsx_bytes = export_xlsx_bytes(df_export)
-    pdf_bytes = export_pdf_bytes(
-        df_export,
-        title=f"Trip Logbook — {selected_period_name} ({start_date} to {end_date})",
-        total_km=total_km
-    )
-
-    e1, e2, e3 = st.columns(3)
-    with e1:
-        st.download_button(
-            "⬇️ CSV",
-            data=csv_bytes,
-            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-    with e2:
-        st.download_button(
-            "⬇️ XLSX",
-            data=xlsx_bytes,
-            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-        )
-    with e3:
-        st.download_button(
-            "⬇️ PDF",
-            data=pdf_bytes,
-            file_name=f"trips_{selected_period_name}_{start_date}_to_{end_date}.pdf",
-            mime="application/pdf",
-            use_container_width=True,
-        )
-
     st.divider()
 
-    # Manage trips (FIXED st.data_editor types)
+    # Manage trips (edit/delete)
     st.subheader("Manage trips (edit / delete)")
-
     if df.empty:
         st.info("Nothing to manage for this selection.")
     else:
         manage_df = df.copy()
-
-        # Convert trip_date to actual date objects (required for DateColumn)
         manage_df["trip_date"] = pd.to_datetime(manage_df["trip_date"], errors="coerce").dt.date
-
-        # Convert distance to float (required for NumberColumn stability)
         manage_df["distance_km"] = pd.to_numeric(manage_df["distance_km"], errors="coerce").fillna(0.0).astype(float)
-
         manage_df["car_label"] = manage_df["car_id"].map(car_id_to_label).fillna("")
         manage_df["DELETE"] = False
 
-        # Keep only needed columns
         manage_df = manage_df[[
             "DELETE", "trip_date", "car_label", "departure", "arrival", "distance_km", "notes", "id"
         ]].copy()
 
-        # Ensure text columns are strings (prevents Streamlit type issues)
         for col in ["departure", "arrival", "notes", "car_label", "id"]:
             manage_df[col] = manage_df[col].fillna("").astype(str)
 
@@ -544,50 +699,85 @@ with tabs[0]:
                 for i in range(len(edited)):
                     new_row = edited.iloc[i]
                     old_row = manage_df.iloc[i]
-                    trip_id = str(new_row["id"])
+                    trip_id = str(new_row["id"]).strip()
 
                     if bool(new_row["DELETE"]):
                         continue
 
                     updates = {}
 
-                    # Date
                     if str(new_row["trip_date"]) != str(old_row["trip_date"]):
                         updates["trip_date"] = str(pd.to_datetime(new_row["trip_date"]).date())
 
-                    # Car
                     if str(new_row["car_label"]) != str(old_row["car_label"]):
                         updates["car_id"] = car_label_to_id.get(str(new_row["car_label"]))
 
-                    # Text fields
                     for field in ["departure", "arrival", "notes"]:
                         nv = "" if pd.isna(new_row[field]) else str(new_row[field]).strip()
                         ov = "" if pd.isna(old_row[field]) else str(old_row[field]).strip()
                         if nv != ov:
                             updates[field] = nv
 
-                    # Distance
                     if float(new_row["distance_km"]) != float(old_row["distance_km"]):
                         updates["distance_km"] = float(new_row["distance_km"])
 
                     if updates:
                         update_trip(trip_id, updates)
-                        upsert_place(str(new_row["departure"]))
-                        upsert_place(str(new_row["arrival"]))
+                        # keep remembering places
+                        if "departure" in updates:
+                            upsert_place(updates["departure"])
+                        if "arrival" in updates:
+                            upsert_place(updates["arrival"])
+                        # also update remembered route distance if dep/arr/distance changed
+                        dep_now = updates.get("departure", str(old_row["departure"]))
+                        arr_now = updates.get("arrival", str(old_row["arrival"]))
+                        dist_now = updates.get("distance_km", float(old_row["distance_km"]))
+                        set_route_distance(dep_now, arr_now, float(dist_now))
                         changes += 1
 
-                st.success(f"Saved edits on {changes} row(s).")
+                st.success(f"Saved edits on {changes} trip(s).")
                 st.rerun()
 
         with b2:
             if st.button("🗑️ Delete selected", use_container_width=True):
                 to_delete = edited.loc[edited["DELETE"] == True, "id"].astype(str).tolist()
                 if not to_delete:
-                    st.info("No rows selected.")
+                    st.info("No trips selected.")
                 else:
                     delete_trips(to_delete)
-                    st.success(f"Deleted {len(to_delete)} row(s).")
+                    st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
+
+    # Export at bottom + filename
+    st.divider()
+    st.subheader("Export")
+
+    default_name = f"{selected_period_name}_{start_date}_to_{end_date}"
+    file_base = st.text_input("File name", value=default_name, help="Used for CSV / XLSX / PDF.")
+    file_base = (file_base or "trips").strip().replace("/", "-")
+
+    if df_export.empty:
+        export_df = pd.DataFrame(columns=["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"])
+    else:
+        export_df = df_export
+
+    csv_bytes = export_csv_bytes(export_df)
+    xlsx_bytes = export_xlsx_bytes(export_df)
+    pdf_bytes = export_pdf_bytes(export_df, f"Trip Logbook — {selected_period_name}", total_km)
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        st.download_button("⬇️ CSV", csv_bytes, f"{file_base}.csv", "text/csv", use_container_width=True)
+    with e2:
+        st.download_button(
+            "⬇️ XLSX",
+            xlsx_bytes,
+            f"{file_base}.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
+        )
+    with e3:
+        st.download_button("⬇️ PDF", pdf_bytes, f"{file_base}.pdf", "application/pdf", use_container_width=True)
 
 
 # ---------- ADMIN TAB ----------
