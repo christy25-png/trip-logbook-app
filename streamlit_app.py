@@ -72,6 +72,10 @@ def parse_year_from_period_name(name: str) -> int:
     return date.today().year
 
 
+def round_half(x: float) -> float:
+    return round(float(x) * 2) / 2.0
+
+
 # =========================
 # SUPABASE HELPERS
 # =========================
@@ -570,13 +574,9 @@ if "dep_typed" not in st.session_state:
 if "arr_typed" not in st.session_state:
     st.session_state.arr_typed = ""
 
-# Distance states (reliable)
+# Distance field (typed)
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 1.0
-if "distance_temp" not in st.session_state:
-    st.session_state.distance_temp = float(st.session_state.distance_value)
-if "distance_confirmed" not in st.session_state:
-    st.session_state.distance_confirmed = True
 
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
@@ -608,6 +608,11 @@ def route_key_for_current(places_list: list[str]) -> str:
 
 
 def maybe_autofill_distance(places_list: list[str]):
+    """
+    When dep/arr changes:
+    - look up stored route distance (works both directions)
+    - if found, fill distance_value (but user can still overwrite)
+    """
     rk = route_key_for_current(places_list)
     if not rk:
         return
@@ -617,22 +622,8 @@ def maybe_autofill_distance(places_list: list[str]):
         arr = get_arr_value(places_list)
         mem = get_route_distance(dep, arr)
         if mem is not None:
-            mem = float(mem)
-            mem = max(0.0, min(200.0, mem))
-            mem = round(mem * 2) / 2.0  # nearest 0.5
-            st.session_state.distance_value = mem
-            st.session_state.distance_temp = mem
-            st.session_state.distance_confirmed = True
-
-
-def apply_distance():
-    st.session_state.distance_value = float(st.session_state.distance_temp)
-    st.session_state.distance_confirmed = True
-
-
-def cancel_distance():
-    st.session_state.distance_temp = float(st.session_state.distance_value)
-    st.session_state.distance_confirmed = True
+            mem = max(0.0, min(200.0, float(mem)))
+            st.session_state.distance_value = round_half(mem)
 
 
 # =========================
@@ -774,105 +765,33 @@ with tabs[0]:
         maybe_autofill_distance(places)
 
         col3, col4 = st.columns(2)
-
-        # =========================
-        # ✅ RELIABLE CHANGE DISTANCE
-        # =========================
         with col3:
-            st.caption("Distance (km)")
-
-            confirmed_badge = "✅" if st.session_state.get("distance_confirmed", True) else "🟡"
-            st.markdown(
-                f"""
-                <div style="
-                    display:flex;
-                    align-items:center;
-                    justify-content:space-between;
-                    padding:10px 12px;
-                    border-radius:12px;
-                    border:1px solid rgba(255,255,255,0.15);
-                    background: rgba(255,255,255,0.04);
-                    ">
-                    <div style="font-size:18px; font-weight:800;">
-                        {float(st.session_state.distance_value):.1f} km
-                        <span style="font-size:14px; font-weight:600; opacity:0.75; margin-left:8px;">
-                            {confirmed_badge}
-                        </span>
-                    </div>
-                    <div style="opacity:0.7; font-size:14px;">
-                        ✏️ edit
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
+            distance = st.number_input(
+                "Distance (km)",
+                min_value=0.0,
+                max_value=2000.0,
+                step=0.5,
+                value=float(st.session_state.distance_value),
+                key="distance_value",
+                help="You can type the distance (0.5 increments).",
             )
-
-            has_popover = hasattr(st, "popover")
-
-            def distance_editor():
-                # Always start temp from current value when opening
-                if st.session_state.distance_temp is None:
-                    st.session_state.distance_temp = float(st.session_state.distance_value)
-
-                st.number_input(
-                    "Set distance",
-                    min_value=0.0,
-                    max_value=200.0,
-                    step=0.5,
-                    value=float(st.session_state.distance_temp),
-                    key="distance_temp",
-                    help="Use 0.5 increments",
-                )
-
-                st.caption(f"Selected: **{float(st.session_state.distance_temp):.1f} km**")
-
-                cA, cB = st.columns(2)
-                with cA:
-                    st.button(
-                        "✅ Use this distance",
-                        use_container_width=True,
-                        key="use_distance_btn",
-                        on_click=apply_distance,
-                    )
-                with cB:
-                    st.button(
-                        "↩️ Cancel",
-                        use_container_width=True,
-                        key="cancel_distance_btn",
-                        on_click=cancel_distance,
-                    )
-
-                # If temp differs from current, show unconfirmed badge
-                if float(st.session_state.distance_temp) != float(st.session_state.distance_value):
-                    st.session_state.distance_confirmed = False
-
-            if has_popover:
-                with st.popover("Change distance", use_container_width=True):
-                    distance_editor()
-            else:
-                with st.expander("Change distance"):
-                    distance_editor()
-
-            distance = float(st.session_state.distance_value)
-
         with col4:
             notes = st.text_input("Notes (optional)", key="notes_input")
 
         if st.button("✅ Save trip", use_container_width=True, key="save_trip_btn"):
-            if not st.session_state.get("distance_confirmed", True):
-                st.error("Please confirm the distance first (tap 'Use this distance').")
-                st.stop()
-
             departure = get_dep_value(places)
             arrival = get_arr_value(places)
 
             if not departure or not arrival:
                 st.error("Please fill in Departure and Arrival.")
             else:
-                insert_trip(selected_period_id, trip_date, car_id, departure, arrival, float(distance), notes)
+                distance_to_save = float(st.session_state.distance_value)
+                insert_trip(selected_period_id, trip_date, car_id, departure, arrival, distance_to_save, notes)
+
                 upsert_place(departure)
                 upsert_place(arrival)
-                set_route_distance(departure, arrival, float(distance))
+                set_route_distance(departure, arrival, distance_to_save)
+
                 st.success("Saved!")
                 st.rerun()
 
