@@ -9,6 +9,11 @@ from supabase import create_client, Client
 from reportlab.lib.pagesizes import A4
 from reportlab.pdfgen import canvas
 
+from openpyxl import Workbook
+from openpyxl.utils.dataframe import dataframe_to_rows
+from openpyxl.styles import Font, Alignment
+from openpyxl.utils import get_column_letter
+
 
 # =========================
 # CONFIG
@@ -36,7 +41,7 @@ PLACE_TYPE_NEW = "✍️ Type a new place..."
 
 
 # =========================
-# ERROR DISPLAY
+# BASIC HELPERS
 # =========================
 def show_api_error(e: Exception):
     st.error("Database request failed.")
@@ -44,26 +49,30 @@ def show_api_error(e: Exception):
     st.exception(e)
 
 
-# =========================
-# STRING NORMALIZATION
-# =========================
 def clean_text(s: str) -> str:
-    """Trim and collapse whitespace (preserves capitalization)."""
     if not s:
         return ""
     return " ".join(str(s).strip().split())
 
 
 def canonical_place(s: str) -> str:
-    """Canonical form used for route distance memory (case/space insensitive)."""
     return clean_text(s).lower()
 
 
 def normalize_pair(a: str, b: str) -> tuple[str, str]:
-    """Canonical + sorted, so A->B and B->A map to the same record."""
     a = canonical_place(a)
     b = canonical_place(b)
     return (a, b) if a <= b else (b, a)
+
+
+def parse_year_from_period_name(name: str) -> int:
+    """
+    If period name is like '2026', use that year; otherwise fallback to current year.
+    """
+    name = clean_text(name)
+    if name.isdigit() and len(name) == 4:
+        return int(name)
+    return date.today().year
 
 
 # =========================
@@ -131,7 +140,7 @@ def get_cars():
         return []
 
 
-def get_places(limit=600):
+def get_places(limit=1000):
     try:
         res = (
             supabase.table("places")
@@ -149,11 +158,6 @@ def get_places(limit=600):
 
 
 def upsert_place(name: str):
-    """
-    Safe place insert that NEVER errors on duplicates:
-    - if exists: update is_active
-    - else: insert
-    """
     name = clean_text(name)
     if not name:
         return
@@ -165,6 +169,7 @@ def upsert_place(name: str):
         else:
             supabase.table("places").insert({"name": name, "is_active": True}).execute()
     except Exception:
+        # should never block saving trips
         pass
 
 
@@ -206,10 +211,11 @@ def set_route_distance(departure: str, arrival: str, distance_km: float):
             .limit(1)
             .execute()
         ).data
+
         if existing:
             rid = existing[0]["id"]
             supabase.table("route_distances").update(
-                {"distance_km": float(distance_km), "updated_at": "now()"}
+                {"distance_km": float(distance_km)}
             ).eq("id", rid).execute()
         else:
             supabase.table("route_distances").insert(
@@ -312,7 +318,7 @@ def update_place(place_id: str, updates: dict):
 
 
 # =========================
-# EXPORT HELPERS
+# RANGE + GROUPING HELPERS
 # =========================
 def month_range(d: date):
     start = d.replace(day=1)
@@ -324,20 +330,53 @@ def month_range(d: date):
     return start, last_day
 
 
+def year_range(year: int):
+    return date(year, 1, 1), date(year, 12, 31)
+
+
+def add_month_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    out = df.copy()
+    out["trip_date"] = pd.to_datetime(out["trip_date"], errors="coerce")
+    out["month_key"] = out["trip_date"].dt.to_period("M").astype(str)  # e.g. "2026-01"
+    out["month_name"] = out["trip_date"].dt.strftime("%B %Y")          # e.g. "January 2026"
+    return out
+
+
+def monthly_totals(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=["Month", "Total distance (km)"])
+    d = add_month_columns(df)
+    d["distance_km"] = pd.to_numeric(d["distance_km"], errors="coerce").fillna(0.0)
+    totals = (
+        d.groupby(["month_key", "month_name"], as_index=False)["distance_km"]
+        .sum()
+        .sort_values("month_key")
+    )
+    totals = totals.rename(columns={"month_name": "Month", "distance_km": "Total distance (km)"})
+    totals["Total distance (km)"] = totals["Total distance (km)"].round(1)
+    return totals[["Month", "Total distance (km)"]]
+
+
+# =========================
+# EXPORT PREP
+# =========================
 def make_export_df(df: pd.DataFrame, car_id_to_label: dict) -> pd.DataFrame:
     if df.empty:
         return df
     out = df.copy()
     out["Car"] = out["car_id"].map(car_id_to_label).fillna("")
+    out["Date"] = pd.to_datetime(out["trip_date"]).dt.date.astype(str)
     out = out.rename(columns={
-        "trip_date": "Date",
         "departure": "Departure",
         "arrival": "Arrival",
         "distance_km": "Distance (km)",
         "notes": "Notes",
     })
+    out["Distance (km)"] = pd.to_numeric(out["Distance (km)"], errors="coerce").fillna(0.0).round(1)
     out = out[["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]]
-    out["Date"] = pd.to_datetime(out["Date"]).dt.date.astype(str)
+    out["Notes"] = out["Notes"].fillna("")
     return out
 
 
@@ -347,59 +386,232 @@ def export_csv_bytes(df: pd.DataFrame) -> bytes:
     return buff.getvalue().encode("utf-8")
 
 
-def export_xlsx_bytes(df: pd.DataFrame) -> bytes:
+def _autosize_worksheet(ws):
+    for col in ws.columns:
+        max_len = 0
+        col_letter = get_column_letter(col[0].column)
+        for cell in col:
+            try:
+                val = "" if cell.value is None else str(cell.value)
+                max_len = max(max_len, len(val))
+            except Exception:
+                pass
+        ws.column_dimensions[col_letter].width = min(max_len + 2, 45)
+
+
+def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, title: str) -> bytes:
+    """
+    XLSX output:
+    - Summary sheet with totals per month
+    - One sheet per month with trips + monthly total
+    """
+    wb = Workbook()
+    ws_summary = wb.active
+    ws_summary.title = "Summary"
+
+    # Summary title
+    ws_summary["A1"] = title
+    ws_summary["A1"].font = Font(bold=True, size=14)
+    ws_summary["A2"] = "Monthly totals"
+    ws_summary["A2"].font = Font(bold=True, size=12)
+
+    totals = monthly_totals(df_raw)
+    if totals.empty:
+        ws_summary["A4"] = "No trips in this selection."
+    else:
+        # write totals table from row 4
+        start_row = 4
+        for r_idx, row in enumerate(dataframe_to_rows(totals, index=False, header=True), start_row):
+            for c_idx, value in enumerate(row, 1):
+                ws_summary.cell(row=r_idx, column=c_idx, value=value)
+                if r_idx == start_row:
+                    ws_summary.cell(row=r_idx, column=c_idx).font = Font(bold=True)
+
+        _autosize_worksheet(ws_summary)
+        ws_summary.freeze_panes = "A5"
+
+    # Per-month sheets
+    if not df_raw.empty:
+        d = add_month_columns(df_raw)
+        d["trip_date"] = pd.to_datetime(d["trip_date"]).dt.date.astype(str)
+        d["distance_km"] = pd.to_numeric(d["distance_km"], errors="coerce").fillna(0.0)
+
+        # attach car label and export columns
+        # build mapping from df_export by Date/Departure/Arrival/Distance/Notes/Car
+        # easiest: recreate export per month using df_raw + car mapping already in df_export logic
+        # We'll re-use df_export for formatting, but need month grouping, so regenerate:
+        # (we'll just merge by id)
+        # df_raw has id - we can map into export by building export from df_raw directly in code below.
+        # For simplicity: reconstruct month exports from df_raw using df_export logic isn't possible without car labels.
+        # We'll instead require a "car_id_to_label" map outside; to keep function signature small,
+        # we store car_id labels in df_raw prior to calling this function in main code.
+        # In this file, we already do that before calling export.
+        pass
+
+    # We’ll build month sheets from df_export + month info from df_raw (same row order by created_at)
+    if not df_raw.empty and not df_export.empty:
+        d = add_month_columns(df_raw)
+        # create a working copy aligned by index (same order)
+        work = df_export.copy()
+        work["month_key"] = d["month_key"].values
+        work["month_name"] = d["month_name"].values
+
+        # group by month_key
+        month_keys = sorted(work["month_key"].dropna().unique().tolist())
+        for mk in month_keys:
+            block = work[work["month_key"] == mk].copy()
+            month_name = block["month_name"].iloc[0] if not block.empty else mk
+
+            # sheet name must be <= 31 chars and unique
+            # use "Jan" etc
+            dt = pd.Period(mk).to_timestamp()
+            sheet_name = dt.strftime("%b")  # Jan, Feb...
+            if sheet_name in wb.sheetnames:
+                # if duplicates (rare), append number
+                n = 2
+                while f"{sheet_name}{n}" in wb.sheetnames:
+                    n += 1
+                sheet_name = f"{sheet_name}{n}"
+
+            ws = wb.create_sheet(title=sheet_name)
+
+            ws["A1"] = month_name
+            ws["A1"].font = Font(bold=True, size=13)
+            ws["A2"] = f"Monthly total: {block['Distance (km)'].sum():.1f} km"
+            ws["A2"].font = Font(bold=True)
+
+            # Write table starting row 4
+            table = block[["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]].copy()
+            start_row = 4
+            for r_idx, row in enumerate(dataframe_to_rows(table, index=False, header=True), start_row):
+                for c_idx, value in enumerate(row, 1):
+                    ws.cell(row=r_idx, column=c_idx, value=value)
+                    if r_idx == start_row:
+                        ws.cell(row=r_idx, column=c_idx).font = Font(bold=True)
+
+            ws.freeze_panes = "A5"
+            _autosize_worksheet(ws)
+
+    # remove the default extra sheet if present (Workbook creates one)
+    # we already reused it as Summary, so it's fine.
+
     buff = io.BytesIO()
-    with pd.ExcelWriter(buff, engine="openpyxl") as writer:
-        df.to_excel(writer, sheet_name="Trips", index=False)
+    wb.save(buff)
     return buff.getvalue()
 
 
-def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
+def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, title: str) -> bytes:
+    """
+    PDF with month sections:
+    - Month title
+    - Monthly total
+    - Trips table
+    """
     buff = io.BytesIO()
     c = canvas.Canvas(buff, pagesize=A4)
 
-    x = 40
-    y = A4[1] - 50
-    c.setFont("Helvetica-Bold", 14)
-    c.drawString(x, y, title)
+    width, height = A4
+    left = 40
+    top = height - 50
 
-    y -= 20
+    def new_page():
+        c.showPage()
+        return height - 50
+
+    # cover/header
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(left, top, title)
+    y = top - 24
+
+    totals = monthly_totals(df_raw)
     c.setFont("Helvetica", 11)
-    c.drawString(x, y, f"Total distance: {total_km:.1f} km")
-    y -= 25
-
-    if df.empty:
-        c.setFont("Helvetica", 10)
-        c.drawString(x, y, "No trips found.")
+    if totals.empty:
+        c.drawString(left, y, "No trips in this selection.")
         c.showPage()
         c.save()
         return buff.getvalue()
 
-    headers = list(df.columns)
-    col_widths = [75, 70, 135, 135, 75, 120]
+    overall_total = float(pd.to_numeric(df_raw["distance_km"], errors="coerce").fillna(0.0).sum())
+    c.drawString(left, y, f"Total distance: {overall_total:.1f} km")
+    y -= 14
+    c.setFont("Helvetica", 10)
+    c.drawString(left, y, "Monthly totals are shown on the next pages.")
+    y = new_page()
 
-    c.setFont("Helvetica-Bold", 9)
-    xx = x
-    for name, cw in zip(headers, col_widths):
-        c.drawString(xx, y, str(name)[:18])
-        xx += cw
+    # Prepare month blocks
+    d = add_month_columns(df_raw)
+    if df_export.empty:
+        c.setFont("Helvetica", 10)
+        c.drawString(left, y, "No trips found.")
+        c.showPage()
+        c.save()
+        return buff.getvalue()
 
-    y -= 12
-    c.setFont("Helvetica", 9)
+    work = df_export.copy()
+    work["month_key"] = d["month_key"].values
+    work["month_name"] = d["month_name"].values
 
-    for _, row in df.iterrows():
-        if y < 60:
-            c.showPage()
-            y = A4[1] - 50
-            c.setFont("Helvetica", 9)
+    month_keys = sorted(work["month_key"].dropna().unique().tolist())
+    for mk in month_keys:
+        block = work[work["month_key"] == mk].copy()
+        month_name = block["month_name"].iloc[0] if not block.empty else mk
+        month_total = float(block["Distance (km)"].sum())
 
-        xx = x
-        values = [row.get(col, "") for col in headers]
-        values = [("" if pd.isna(v) else str(v)) for v in values]
-        for v, cw in zip(values, col_widths):
-            c.drawString(xx, y, v[:28])
+        # month header
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(left, y, month_name)
+        y -= 16
+
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(left, y, f"Monthly total: {month_total:.1f} km")
+        y -= 18
+
+        # table header
+        headers = ["Date", "Car", "Departure", "Arrival", "Km", "Notes"]
+        col_widths = [70, 70, 120, 120, 40, 110]
+
+        c.setFont("Helvetica-Bold", 9)
+        xx = left
+        for h, cw in zip(headers, col_widths):
+            c.drawString(xx, y, h)
             xx += cw
         y -= 12
+
+        c.setFont("Helvetica", 9)
+        for _, row in block.iterrows():
+            if y < 70:
+                y = new_page()
+                c.setFont("Helvetica-Bold", 14)
+                c.drawString(left, y, month_name + " (cont.)")
+                y -= 16
+                c.setFont("Helvetica-Bold", 11)
+                c.drawString(left, y, f"Monthly total: {month_total:.1f} km")
+                y -= 18
+                c.setFont("Helvetica-Bold", 9)
+                xx = left
+                for h, cw in zip(headers, col_widths):
+                    c.drawString(xx, y, h)
+                    xx += cw
+                y -= 12
+                c.setFont("Helvetica", 9)
+
+            values = [
+                str(row.get("Date", ""))[:12],
+                str(row.get("Car", ""))[:12],
+                str(row.get("Departure", ""))[:22],
+                str(row.get("Arrival", ""))[:22],
+                f"{float(row.get('Distance (km)', 0.0)):.1f}",
+                str(row.get("Notes", ""))[:22],
+            ]
+            xx = left
+            for v, cw in zip(values, col_widths):
+                c.drawString(xx, y, v)
+                xx += cw
+            y -= 12
+
+        y -= 14
+        if mk != month_keys[-1]:
+            y = new_page()
 
     c.showPage()
     c.save()
@@ -412,7 +624,6 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
-# Widget-owned keys (do not assign widget return into these)
 if "dep_choice" not in st.session_state:
     st.session_state.dep_choice = ""
 if "arr_choice" not in st.session_state:
@@ -426,8 +637,6 @@ if "distance_value" not in st.session_state:
     st.session_state.distance_value = 0.0
 if "distance_manual" not in st.session_state:
     st.session_state.distance_manual = False
-
-# Track route so we can autofill when route changes (even if user edited distance previously)
 if "last_route_key" not in st.session_state:
     st.session_state.last_route_key = ""
 
@@ -458,20 +667,12 @@ def route_key_for_current(places_list: list[str]) -> str:
 
 
 def maybe_autofill_distance(places_list: list[str]):
-    """
-    Auto-fill from memory whenever the route changes.
-    This keeps it easy for your dad:
-    - Change dep/arr (or swap) -> distance auto-fills
-    - Dad can still edit distance afterwards
-    """
     rk = route_key_for_current(places_list)
     if not rk:
         return
-
     if rk != st.session_state.last_route_key:
         st.session_state.last_route_key = rk
-        st.session_state.distance_manual = False  # new route -> allow autofill
-
+        st.session_state.distance_manual = False
         dep = get_dep_value(places_list)
         arr = get_arr_value(places_list)
         mem = get_route_distance(dep, arr)
@@ -561,7 +762,7 @@ with tabs[0]:
     if st.session_state.arr_choice and st.session_state.arr_choice not in arr_options:
         st.session_state.arr_choice = PLACE_TYPE_NEW
 
-    # ----- Add a trip -----
+    # ----- Add trip -----
     st.subheader("Add a trip")
     with st.container(border=True):
         col1, col2 = st.columns(2)
@@ -572,7 +773,6 @@ with tabs[0]:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        # Swap button
         swap_col1, swap_col2 = st.columns([1, 3])
         with swap_col1:
             if st.button("↔ Swap", use_container_width=True):
@@ -584,13 +784,11 @@ with tabs[0]:
                     st.session_state.arr_typed,
                     st.session_state.dep_typed,
                 )
-                # route changed -> autofill
                 maybe_autofill_distance(places)
                 st.rerun()
         with swap_col2:
             st.caption("Swap Departure and Arrival")
 
-        # Departure / Arrival (autofill when route changes)
         st.selectbox(
             "Departure",
             dep_options,
@@ -621,7 +819,6 @@ with tabs[0]:
                 on_change=lambda: maybe_autofill_distance(places),
             )
 
-        # Ensure we try autofill on first render when both are already chosen
         maybe_autofill_distance(places)
 
         col3, col4 = st.columns(2)
@@ -648,60 +845,87 @@ with tabs[0]:
                 st.error("Please fill in Departure and Arrival.")
             else:
                 insert_trip(selected_period_id, trip_date, car_id, departure, arrival, float(distance), notes)
-
                 upsert_place(departure)
                 upsert_place(arrival)
-
-                # Update memory for BOTH directions
                 set_route_distance(departure, arrival, float(distance))
-
-                # After save, next route change will autofill again
                 st.session_state.distance_manual = False
-
                 st.success("Saved!")
                 st.rerun()
 
     st.divider()
 
-    # ----- Range controls -----
-    colr1, colr2 = st.columns([1, 2])
-    with colr1:
-        range_mode = st.radio("Range", ["This month", "Custom"], horizontal=False)
-    with colr2:
-        if range_mode == "This month":
-            pick = st.date_input("Month", value=date.today())
-            start_date, end_date = month_range(pick)
-        else:
-            cA, cB = st.columns(2)
-            with cA:
-                start_date = st.date_input("Start", value=date(date.today().year, 1, 1))
-            with cB:
-                end_date = st.date_input("End", value=date.today())
+    # ----- View mode -----
+    st.subheader("View trips")
+    view_mode = st.radio(
+        "View mode",
+        ["One month", "All months (year)", "Custom range"],
+        horizontal=True
+    )
+
+    year_for_period = parse_year_from_period_name(selected_period_name)
+
+    if view_mode == "One month":
+        pick = st.date_input("Pick a day in the month", value=date.today())
+        start_date, end_date = month_range(pick)
+    elif view_mode == "All months (year)":
+        start_date, end_date = year_range(year_for_period)
+        st.caption(f"Showing: **{year_for_period} (January → December)**")
+    else:
+        cA, cB = st.columns(2)
+        with cA:
+            start_date = st.date_input("Start", value=date(year_for_period, 1, 1))
+        with cB:
+            end_date = st.date_input("End", value=date.today())
 
     colf1, colf2 = st.columns(2)
     with colf1:
-        filter_car = st.selectbox("Car", ["All cars"] + car_labels)
+        filter_car = st.selectbox("Car filter", ["All cars"] + car_labels)
     with colf2:
-        search_text = st.text_input("Search", placeholder="type to search...")
+        search_text = st.text_input("Search (departure/arrival/notes)", placeholder="type to search...")
 
     filter_car_id = None if filter_car == "All cars" else car_label_to_id[filter_car]
 
     df = fetch_entries(selected_period_id, start_date, end_date, car_id=filter_car_id, search_text=search_text)
-
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
-    st.metric("Total distance", f"{total_km:.1f} km")
+    st.metric("Total distance (selected)", f"{total_km:.1f} km")
 
-    # Trips table
-    st.subheader("Trips")
+    # If all months: show monthly totals in UI
+    if view_mode == "All months (year)" and not df.empty:
+        st.write("### Total distance per month")
+        st.dataframe(monthly_totals(df), use_container_width=True, hide_index=True)
+
+    # Trips section (with explicit month divisions if all months)
+    st.write("### Trips")
     df_export = make_export_df(df, car_id_to_label)
-    if df_export.empty:
+
+    if df.empty:
         st.info("No trips found.")
     else:
-        st.dataframe(df_export, use_container_width=True, hide_index=True)
+        if view_mode == "All months (year)":
+            d = add_month_columns(df)
+            # align export to raw index
+            df_export_block = df_export.copy()
+            df_export_block["month_key"] = d["month_key"].values
+            df_export_block["month_name"] = d["month_name"].values
+
+            for mk in sorted(df_export_block["month_key"].unique().tolist()):
+                block = df_export_block[df_export_block["month_key"] == mk].copy()
+                month_name = block["month_name"].iloc[0]
+                month_total = float(block["Distance (km)"].sum())
+
+                st.subheader(month_name)
+                st.caption(f"Monthly total: **{month_total:.1f} km**")
+                st.dataframe(
+                    block[["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.dataframe(df_export, use_container_width=True, hide_index=True)
 
     st.divider()
 
-    # Manage trips table
+    # Manage trips
     st.subheader("Manage trips (edit / delete)")
     if df.empty:
         st.info("Nothing to manage for this selection.")
@@ -791,7 +1015,7 @@ with tabs[0]:
                     st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
 
-    # Export at bottom + filename
+    # Export at bottom + polished grouping
     st.divider()
     st.subheader("Export")
 
@@ -804,8 +1028,10 @@ with tabs[0]:
     )
 
     csv_bytes = export_csv_bytes(export_df)
-    xlsx_bytes = export_xlsx_bytes(export_df)
-    pdf_bytes = export_pdf_bytes(export_df, f"Trip Logbook — {selected_period_name}", total_km)
+
+    xlsx_title = f"Trip Logbook — {selected_period_name}"
+    xlsx_bytes = export_xlsx_bytes_grouped(export_df, df, xlsx_title)
+    pdf_bytes = export_pdf_bytes_grouped(export_df, df, xlsx_title)
 
     e1, e2, e3 = st.columns(3)
     with e1:
@@ -829,15 +1055,36 @@ with tabs[1]:
     else:
         st.header("Admin Panel")
 
-        st.write("### Places manager (rename / deactivate)")
+        st.write("### Places manager")
+
+        # Add place
+        add_col1, add_col2 = st.columns([3, 1])
+        with add_col1:
+            new_place = st.text_input("Add a new place", placeholder="Type a place name (e.g. Amsterdam)")
+        with add_col2:
+            if st.button("➕ Add", use_container_width=True):
+                if clean_text(new_place):
+                    upsert_place(new_place)
+                    st.success("Place added.")
+                    st.rerun()
+                else:
+                    st.error("Type a place name first.")
+
+        # Filter/search
+        place_filter = st.text_input("Search places", placeholder="type to filter...")
+
         places_df = fetch_places_admin()
         if places_df.empty:
             st.info("No places yet. They appear automatically when trips are saved.")
         else:
             places_df = places_df[["id", "name", "is_active", "created_at"]].copy()
-            for col in ["id", "name"]:
-                places_df[col] = places_df[col].fillna("").astype(str)
+            places_df["name"] = places_df["name"].fillna("").astype(str)
 
+            if place_filter.strip():
+                s = place_filter.strip().lower()
+                places_df = places_df[places_df["name"].str.lower().str.contains(s, na=False)].copy()
+
+            st.caption("Edit names, or deactivate places (they won’t show in your dad’s dropdown).")
             edited_places = st.data_editor(
                 places_df,
                 use_container_width=True,
