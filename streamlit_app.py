@@ -11,7 +11,7 @@ from reportlab.pdfgen import canvas
 
 from openpyxl import Workbook
 from openpyxl.utils.dataframe import dataframe_to_rows
-from openpyxl.styles import Font, Alignment
+from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 
 
@@ -66,9 +66,6 @@ def normalize_pair(a: str, b: str) -> tuple[str, str]:
 
 
 def parse_year_from_period_name(name: str) -> int:
-    """
-    If period name is like '2026', use that year; otherwise fallback to current year.
-    """
     name = clean_text(name)
     if name.isdigit() and len(name) == 4:
         return int(name)
@@ -169,7 +166,6 @@ def upsert_place(name: str):
         else:
             supabase.table("places").insert({"name": name, "is_active": True}).execute()
     except Exception:
-        # should never block saving trips
         pass
 
 
@@ -214,9 +210,7 @@ def set_route_distance(departure: str, arrival: str, distance_km: float):
 
         if existing:
             rid = existing[0]["id"]
-            supabase.table("route_distances").update(
-                {"distance_km": float(distance_km)}
-            ).eq("id", rid).execute()
+            supabase.table("route_distances").update({"distance_km": float(distance_km)}).eq("id", rid).execute()
         else:
             supabase.table("route_distances").insert(
                 {"place_a": a, "place_b": b, "distance_km": float(distance_km)}
@@ -339,8 +333,8 @@ def add_month_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
     out = df.copy()
     out["trip_date"] = pd.to_datetime(out["trip_date"], errors="coerce")
-    out["month_key"] = out["trip_date"].dt.to_period("M").astype(str)  # e.g. "2026-01"
-    out["month_name"] = out["trip_date"].dt.strftime("%B %Y")          # e.g. "January 2026"
+    out["month_key"] = out["trip_date"].dt.to_period("M").astype(str)
+    out["month_name"] = out["trip_date"].dt.strftime("%B %Y")
     return out
 
 
@@ -400,16 +394,10 @@ def _autosize_worksheet(ws):
 
 
 def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, title: str) -> bytes:
-    """
-    XLSX output:
-    - Summary sheet with totals per month
-    - One sheet per month with trips + monthly total
-    """
     wb = Workbook()
     ws_summary = wb.active
     ws_summary.title = "Summary"
 
-    # Summary title
     ws_summary["A1"] = title
     ws_summary["A1"].font = Font(bold=True, size=14)
     ws_summary["A2"] = "Monthly totals"
@@ -419,68 +407,40 @@ def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, tit
     if totals.empty:
         ws_summary["A4"] = "No trips in this selection."
     else:
-        # write totals table from row 4
         start_row = 4
         for r_idx, row in enumerate(dataframe_to_rows(totals, index=False, header=True), start_row):
             for c_idx, value in enumerate(row, 1):
                 ws_summary.cell(row=r_idx, column=c_idx, value=value)
                 if r_idx == start_row:
                     ws_summary.cell(row=r_idx, column=c_idx).font = Font(bold=True)
-
-        _autosize_worksheet(ws_summary)
         ws_summary.freeze_panes = "A5"
+        _autosize_worksheet(ws_summary)
 
-    # Per-month sheets
-    if not df_raw.empty:
-        d = add_month_columns(df_raw)
-        d["trip_date"] = pd.to_datetime(d["trip_date"]).dt.date.astype(str)
-        d["distance_km"] = pd.to_numeric(d["distance_km"], errors="coerce").fillna(0.0)
-
-        # attach car label and export columns
-        # build mapping from df_export by Date/Departure/Arrival/Distance/Notes/Car
-        # easiest: recreate export per month using df_raw + car mapping already in df_export logic
-        # We'll re-use df_export for formatting, but need month grouping, so regenerate:
-        # (we'll just merge by id)
-        # df_raw has id - we can map into export by building export from df_raw directly in code below.
-        # For simplicity: reconstruct month exports from df_raw using df_export logic isn't possible without car labels.
-        # We'll instead require a "car_id_to_label" map outside; to keep function signature small,
-        # we store car_id labels in df_raw prior to calling this function in main code.
-        # In this file, we already do that before calling export.
-        pass
-
-    # We’ll build month sheets from df_export + month info from df_raw (same row order by created_at)
     if not df_raw.empty and not df_export.empty:
         d = add_month_columns(df_raw)
-        # create a working copy aligned by index (same order)
         work = df_export.copy()
         work["month_key"] = d["month_key"].values
         work["month_name"] = d["month_name"].values
 
-        # group by month_key
         month_keys = sorted(work["month_key"].dropna().unique().tolist())
         for mk in month_keys:
             block = work[work["month_key"] == mk].copy()
             month_name = block["month_name"].iloc[0] if not block.empty else mk
 
-            # sheet name must be <= 31 chars and unique
-            # use "Jan" etc
             dt = pd.Period(mk).to_timestamp()
-            sheet_name = dt.strftime("%b")  # Jan, Feb...
+            sheet_name = dt.strftime("%b")
             if sheet_name in wb.sheetnames:
-                # if duplicates (rare), append number
                 n = 2
                 while f"{sheet_name}{n}" in wb.sheetnames:
                     n += 1
                 sheet_name = f"{sheet_name}{n}"
 
             ws = wb.create_sheet(title=sheet_name)
-
             ws["A1"] = month_name
             ws["A1"].font = Font(bold=True, size=13)
             ws["A2"] = f"Monthly total: {block['Distance (km)'].sum():.1f} km"
             ws["A2"].font = Font(bold=True)
 
-            # Write table starting row 4
             table = block[["Date", "Car", "Departure", "Arrival", "Distance (km)", "Notes"]].copy()
             start_row = 4
             for r_idx, row in enumerate(dataframe_to_rows(table, index=False, header=True), start_row):
@@ -492,21 +452,12 @@ def export_xlsx_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, tit
             ws.freeze_panes = "A5"
             _autosize_worksheet(ws)
 
-    # remove the default extra sheet if present (Workbook creates one)
-    # we already reused it as Summary, so it's fine.
-
     buff = io.BytesIO()
     wb.save(buff)
     return buff.getvalue()
 
 
 def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, title: str) -> bytes:
-    """
-    PDF with month sections:
-    - Month title
-    - Monthly total
-    - Trips table
-    """
     buff = io.BytesIO()
     c = canvas.Canvas(buff, pagesize=A4)
 
@@ -518,7 +469,6 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
         c.showPage()
         return height - 50
 
-    # cover/header
     c.setFont("Helvetica-Bold", 16)
     c.drawString(left, top, title)
     y = top - 24
@@ -533,20 +483,9 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
 
     overall_total = float(pd.to_numeric(df_raw["distance_km"], errors="coerce").fillna(0.0).sum())
     c.drawString(left, y, f"Total distance: {overall_total:.1f} km")
-    y -= 14
-    c.setFont("Helvetica", 10)
-    c.drawString(left, y, "Monthly totals are shown on the next pages.")
     y = new_page()
 
-    # Prepare month blocks
     d = add_month_columns(df_raw)
-    if df_export.empty:
-        c.setFont("Helvetica", 10)
-        c.drawString(left, y, "No trips found.")
-        c.showPage()
-        c.save()
-        return buff.getvalue()
-
     work = df_export.copy()
     work["month_key"] = d["month_key"].values
     work["month_name"] = d["month_name"].values
@@ -554,10 +493,9 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
     month_keys = sorted(work["month_key"].dropna().unique().tolist())
     for mk in month_keys:
         block = work[work["month_key"] == mk].copy()
-        month_name = block["month_name"].iloc[0] if not block.empty else mk
+        month_name = block["month_name"].iloc[0]
         month_total = float(block["Distance (km)"].sum())
 
-        # month header
         c.setFont("Helvetica-Bold", 14)
         c.drawString(left, y, month_name)
         y -= 16
@@ -566,7 +504,6 @@ def export_pdf_bytes_grouped(df_export: pd.DataFrame, df_raw: pd.DataFrame, titl
         c.drawString(left, y, f"Monthly total: {month_total:.1f} km")
         y -= 18
 
-        # table header
         headers = ["Date", "Car", "Departure", "Arrival", "Km", "Notes"]
         col_widths = [70, 70, 120, 120, 40, 110]
 
@@ -634,7 +571,7 @@ if "arr_typed" not in st.session_state:
     st.session_state.arr_typed = ""
 
 if "distance_value" not in st.session_state:
-    st.session_state.distance_value = 0.0
+    st.session_state.distance_value = 1.0
 if "distance_manual" not in st.session_state:
     st.session_state.distance_manual = False
 if "last_route_key" not in st.session_state:
@@ -677,7 +614,11 @@ def maybe_autofill_distance(places_list: list[str]):
         arr = get_arr_value(places_list)
         mem = get_route_distance(dep, arr)
         if mem is not None:
-            st.session_state.distance_value = float(mem)
+            # slider is 1..200 in steps of 0.5; clamp
+            mem = float(mem)
+            mem = max(1.0, min(200.0, mem))
+            mem = round(mem * 2) / 2.0
+            st.session_state.distance_value = mem
 
 
 def on_distance_change():
@@ -693,7 +634,6 @@ tabs = st.tabs(["🧾 Trip Log", "🛠️ Admin"])
 
 # ---------- TRIP LOG TAB ----------
 with tabs[0]:
-    # Admin unlock
     with st.expander("🔐 Admin mode"):
         if not ADMIN_PIN:
             st.info("Set ADMIN_PIN in Streamlit secrets to enable Admin features.")
@@ -711,7 +651,6 @@ with tabs[0]:
                 st.session_state.is_admin = False
                 st.info("Admin mode disabled.")
 
-    # Period selection (default current year)
     st.subheader("Period (logbook)")
     current_year_name = str(date.today().year)
     ensure_period(current_year_name)
@@ -739,7 +678,6 @@ with tabs[0]:
             else:
                 st.error("Type a name first (e.g. 2027).")
 
-    # Cars
     cars = get_cars()
     if not cars:
         st.error("No active cars found. Add your cars in the 'cars' table.")
@@ -762,7 +700,6 @@ with tabs[0]:
     if st.session_state.arr_choice and st.session_state.arr_choice not in arr_options:
         st.session_state.arr_choice = PLACE_TYPE_NEW
 
-    # ----- Add trip -----
     st.subheader("Add a trip")
     with st.container(border=True):
         col1, col2 = st.columns(2)
@@ -823,13 +760,18 @@ with tabs[0]:
 
         col3, col4 = st.columns(2)
         with col3:
-            distance = st.number_input(
+            # SLIDER 1..200 step 0.5 (dad-friendly)
+            slider_value = float(st.session_state.distance_value)
+            slider_value = max(1.0, min(200.0, slider_value))
+            slider_value = round(slider_value * 2) / 2.0  # to nearest 0.5
+
+            distance = st.slider(
                 "Distance (km)",
-                min_value=0.0,
-                step=0.1,
-                format="%.1f",
-                value=float(st.session_state.distance_value),
-                key="distance_input",
+                min_value=1.0,
+                max_value=200.0,
+                value=slider_value,
+                step=0.5,
+                key="distance_slider",
                 on_change=on_distance_change,
             )
         with col4:
@@ -854,7 +796,6 @@ with tabs[0]:
 
     st.divider()
 
-    # ----- View mode -----
     st.subheader("View trips")
     view_mode = st.radio(
         "View mode",
@@ -889,12 +830,10 @@ with tabs[0]:
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
     st.metric("Total distance (selected)", f"{total_km:.1f} km")
 
-    # If all months: show monthly totals in UI
     if view_mode == "All months (year)" and not df.empty:
         st.write("### Total distance per month")
         st.dataframe(monthly_totals(df), use_container_width=True, hide_index=True)
 
-    # Trips section (with explicit month divisions if all months)
     st.write("### Trips")
     df_export = make_export_df(df, car_id_to_label)
 
@@ -903,7 +842,6 @@ with tabs[0]:
     else:
         if view_mode == "All months (year)":
             d = add_month_columns(df)
-            # align export to raw index
             df_export_block = df_export.copy()
             df_export_block["month_key"] = d["month_key"].values
             df_export_block["month_name"] = d["month_name"].values
@@ -925,7 +863,6 @@ with tabs[0]:
 
     st.divider()
 
-    # Manage trips
     st.subheader("Manage trips (edit / delete)")
     if df.empty:
         st.info("Nothing to manage for this selection.")
@@ -999,7 +936,6 @@ with tabs[0]:
                         upsert_place(dep_now)
                         upsert_place(arr_now)
                         set_route_distance(dep_now, arr_now, float(dist_now))
-
                         changes += 1
 
                 st.success(f"Saved edits on {changes} trip(s).")
@@ -1015,7 +951,6 @@ with tabs[0]:
                     st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
 
-    # Export at bottom + polished grouping
     st.divider()
     st.subheader("Export")
 
@@ -1028,10 +963,9 @@ with tabs[0]:
     )
 
     csv_bytes = export_csv_bytes(export_df)
-
-    xlsx_title = f"Trip Logbook — {selected_period_name}"
-    xlsx_bytes = export_xlsx_bytes_grouped(export_df, df, xlsx_title)
-    pdf_bytes = export_pdf_bytes_grouped(export_df, df, xlsx_title)
+    title = f"Trip Logbook — {selected_period_name}"
+    xlsx_bytes = export_xlsx_bytes_grouped(export_df, df, title)
+    pdf_bytes = export_pdf_bytes_grouped(export_df, df, title)
 
     e1, e2, e3 = st.columns(3)
     with e1:
@@ -1054,10 +988,8 @@ with tabs[1]:
         st.info("Admin is locked. Unlock it in the Trip Log tab.")
     else:
         st.header("Admin Panel")
-
         st.write("### Places manager")
 
-        # Add place
         add_col1, add_col2 = st.columns([3, 1])
         with add_col1:
             new_place = st.text_input("Add a new place", placeholder="Type a place name (e.g. Amsterdam)")
@@ -1070,10 +1002,9 @@ with tabs[1]:
                 else:
                     st.error("Type a place name first.")
 
-        # Filter/search
         place_filter = st.text_input("Search places", placeholder="type to filter...")
-
         places_df = fetch_places_admin()
+
         if places_df.empty:
             st.info("No places yet. They appear automatically when trips are saved.")
         else:
@@ -1084,7 +1015,7 @@ with tabs[1]:
                 s = place_filter.strip().lower()
                 places_df = places_df[places_df["name"].str.lower().str.contains(s, na=False)].copy()
 
-            st.caption("Edit names, or deactivate places (they won’t show in your dad’s dropdown).")
+            st.caption("Edit names, or deactivate places (they won’t show in the dropdown).")
             edited_places = st.data_editor(
                 places_df,
                 use_container_width=True,
