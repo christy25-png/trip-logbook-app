@@ -65,9 +65,6 @@ def get_periods():
 
 
 def ensure_period(name: str) -> str | None:
-    """
-    Ensure a period exists (by name) and return its id.
-    """
     name = (name or "").strip()
     if not name:
         return None
@@ -132,12 +129,6 @@ def get_places(limit=600):
 
 
 def upsert_place(name: str):
-    """
-    Never crash on duplicates:
-      - SELECT by name
-      - if exists -> UPDATE
-      - else -> INSERT
-    """
     name = (name or "").strip()
     if not name:
         return
@@ -149,14 +140,12 @@ def upsert_place(name: str):
         else:
             supabase.table("places").insert({"name": name, "is_active": True}).execute()
     except Exception:
-        # place memory must never block saving trips
         pass
 
 
 def normalize_pair(a: str, b: str) -> tuple[str, str]:
     a = (a or "").strip()
     b = (b or "").strip()
-    # case-insensitive normalization
     return (a, b) if a.lower() <= b.lower() else (b, a)
 
 
@@ -206,7 +195,6 @@ def set_route_distance(departure: str, arrival: str, distance_km: float):
                 {"place_a": a, "place_b": b, "distance_km": float(distance_km)}
             ).execute()
     except Exception:
-        # distance memory must never block saving trips
         pass
 
 
@@ -403,7 +391,7 @@ def export_pdf_bytes(df: pd.DataFrame, title: str, total_km: float) -> bytes:
 if "is_admin" not in st.session_state:
     st.session_state.is_admin = False
 
-# For swap + remembering typed/select
+# Keys used by widgets (do NOT assign widget return values into these keys)
 if "dep_choice" not in st.session_state:
     st.session_state.dep_choice = ""
 if "arr_choice" not in st.session_state:
@@ -413,9 +401,6 @@ if "dep_typed" not in st.session_state:
 if "arr_typed" not in st.session_state:
     st.session_state.arr_typed = ""
 
-# Distance behavior:
-# - auto-fill when dep/arr change (from memory)
-# - allow user override afterwards
 if "distance_value" not in st.session_state:
     st.session_state.distance_value = 0.0
 if "distance_manual" not in st.session_state:
@@ -439,21 +424,12 @@ def get_arr_value(places_list: list[str]) -> str:
 
 
 def autofill_distance_if_possible(places_list: list[str]):
-    """
-    Called whenever dep/arr changes.
-    We auto-fill distance from memory and reset manual flag.
-    """
     st.session_state.distance_manual = False
     dep = get_dep_value(places_list)
     arr = get_arr_value(places_list)
     d = get_route_distance(dep, arr)
     if d is not None:
         st.session_state.distance_value = float(d)
-    else:
-        # If no memory: keep whatever current distance is (don’t wipe user input)
-        # but if user hasn't manually set anything, keep it at 0
-        if not st.session_state.distance_manual and st.session_state.distance_value is None:
-            st.session_state.distance_value = 0.0
 
 
 def on_distance_change():
@@ -499,7 +475,6 @@ with tabs[0]:
 
     period_names = [p["name"] for p in periods]
     period_name_to_id = {p["name"]: p["id"] for p in periods}
-
     default_index = period_names.index(current_year_name) if current_year_name in period_names else 0
 
     colp1, colp2 = st.columns([2, 1])
@@ -531,10 +506,10 @@ with tabs[0]:
     car_labels = list(car_label_to_id.keys())
 
     places = get_places()
-
-    # keep choice values valid
     dep_options = places + [PLACE_TYPE_NEW]
     arr_options = places + [PLACE_TYPE_NEW]
+
+    # keep current selections valid
     if st.session_state.dep_choice and st.session_state.dep_choice not in dep_options:
         st.session_state.dep_choice = PLACE_TYPE_NEW
     if st.session_state.arr_choice and st.session_state.arr_choice not in arr_options:
@@ -551,7 +526,7 @@ with tabs[0]:
             car_label = st.selectbox("Car", car_labels)
             car_id = car_label_to_id[car_label]
 
-        # Swap button (WORKING)
+        # Swap button (works)
         swap_col1, swap_col2 = st.columns([1, 3])
         with swap_col1:
             if st.button("↔ Swap", use_container_width=True):
@@ -568,8 +543,9 @@ with tabs[0]:
         with swap_col2:
             st.caption("Swap Departure and Arrival")
 
-        # Departure / Arrival with on_change -> auto distance
-        st.session_state.dep_choice = st.selectbox(
+        # IMPORTANT FIX:
+        # Do NOT assign widget return values into st.session_state keys.
+        st.selectbox(
             "Departure",
             dep_options,
             index=dep_options.index(st.session_state.dep_choice) if st.session_state.dep_choice in dep_options else 0,
@@ -577,14 +553,14 @@ with tabs[0]:
             on_change=lambda: autofill_distance_if_possible(places),
         )
         if st.session_state.dep_choice == PLACE_TYPE_NEW:
-            st.session_state.dep_typed = st.text_input(
+            st.text_input(
                 "Departure (type)",
                 value=st.session_state.dep_typed,
                 key="dep_typed",
                 on_change=lambda: autofill_distance_if_possible(places),
             )
 
-        st.session_state.arr_choice = st.selectbox(
+        st.selectbox(
             "Arrival",
             arr_options,
             index=arr_options.index(st.session_state.arr_choice) if st.session_state.arr_choice in arr_options else 0,
@@ -592,21 +568,20 @@ with tabs[0]:
             on_change=lambda: autofill_distance_if_possible(places),
         )
         if st.session_state.arr_choice == PLACE_TYPE_NEW:
-            st.session_state.arr_typed = st.text_input(
+            st.text_input(
                 "Arrival (type)",
                 value=st.session_state.arr_typed,
                 key="arr_typed",
                 on_change=lambda: autofill_distance_if_possible(places),
             )
 
-        # If both are set and we haven't filled yet in this session, try once
-        # (helps initial load)
+        # auto-fill distance if possible (only when user hasn't manually edited)
         if not st.session_state.distance_manual:
             dep_now = get_dep_value(places)
             arr_now = get_arr_value(places)
             if dep_now and arr_now:
                 mem = get_route_distance(dep_now, arr_now)
-                if mem is not None and float(mem) != float(st.session_state.distance_value):
+                if mem is not None:
                     st.session_state.distance_value = float(mem)
 
         col3, col4 = st.columns(2)
@@ -623,7 +598,6 @@ with tabs[0]:
         with col4:
             notes = st.text_input("Notes (optional)")
 
-        # keep session in sync
         st.session_state.distance_value = float(distance)
 
         if st.button("✅ Save trip", use_container_width=True):
@@ -634,20 +608,20 @@ with tabs[0]:
                 st.error("Please fill in Departure and Arrival.")
             else:
                 insert_trip(selected_period_id, trip_date, car_id, departure, arrival, float(distance), notes)
-
-                # Remember places (safe)
                 upsert_place(departure)
                 upsert_place(arrival)
-
-                # Remember route distance (works both directions)
                 set_route_distance(departure, arrival, float(distance))
+
+                # after saving, allow next route to autofill again
+                st.session_state.distance_manual = False
 
                 st.success("Saved!")
                 st.rerun()
 
+    # ======= The rest of your app (Trips, Manage, Export, Admin) remains the same style =======
+
     st.divider()
 
-    # ----- Range controls -----
     colr1, colr2 = st.columns([1, 2])
     with colr1:
         range_mode = st.radio("Range", ["This month", "Custom"], horizontal=False)
@@ -675,7 +649,6 @@ with tabs[0]:
     total_km = 0.0 if df.empty else float(pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).sum())
     st.metric("Total distance", f"{total_km:.1f} km")
 
-    # Trips display
     st.subheader("Trips")
     df_export = make_export_df(df, car_id_to_label)
     if df_export.empty:
@@ -685,7 +658,6 @@ with tabs[0]:
 
     st.divider()
 
-    # Manage trips (edit/delete)
     st.subheader("Manage trips (edit / delete)")
     if df.empty:
         st.info("Nothing to manage for this selection.")
@@ -775,7 +747,6 @@ with tabs[0]:
                     st.success(f"Deleted {len(to_delete)} trip(s).")
                     st.rerun()
 
-    # Export at bottom + filename
     st.divider()
     st.subheader("Export")
 
