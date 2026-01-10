@@ -87,19 +87,17 @@ def distance_wheel_picker(
 ) -> float:
     """
     iOS-style wheel picker using an HTML component.
-    Returns the currently picked float.
+    Simulates "infinite" by repeating the list 3x and snapping back to the middle copy.
 
-    It simulates "infinite" by repeating the list 3x and snapping back to the middle copy.
+    IMPORTANT: We do NOT pass key= to components.html() because some Streamlit versions
+    don't support it. Instead, we embed the key into element IDs in the HTML.
     """
-    # build values (as strings) for stable matching
     values = []
-    v = min_value
-    # avoid float drift
     steps = int(round((max_value - min_value) / step))
     for i in range(steps + 1):
         values.append(round(min_value + i * step, 1))
 
-    # clamp/round incoming value
+    # clamp & round
     if value is None:
         value = min_value
     value = float(value)
@@ -107,25 +105,22 @@ def distance_wheel_picker(
     value = round(value / step) * step
     value = round(value, 1)
 
-    # We repeat the list 3 times to do a wrap effect
     values_3x = values + values + values
     base_len = len(values)
 
-    # find the index in the *middle* copy that matches current value
     try:
         idx_in_base = values.index(value)
     except ValueError:
         idx_in_base = 0
     initial_index = base_len + idx_in_base  # middle block
 
-    # HTML + JS (uses streamlit-component-lib bridge)
-    # This is the standard way to send values from HTML back to Streamlit.
     options_html = "\n".join(
         f'<div class="item" data-value="{val:.1f}">{val:.1f}</div>'
         for val in values_3x
     )
 
-    # Some styling to look like iOS wheel
+    list_id = f"list_{key}"
+
     html = f"""
     <html>
       <head>
@@ -133,8 +128,7 @@ def distance_wheel_picker(
         <script src="https://unpkg.com/streamlit-component-lib@1.6.0/dist/streamlit-component-lib.js"></script>
         <style>
           :root {{
-            --h: 34px; /* row height */
-            --w: 100%;
+            --h: 34px;
           }}
           body {{
             margin: 0;
@@ -142,9 +136,6 @@ def distance_wheel_picker(
             background: transparent;
             color: #eaeaea;
             font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-          }}
-          .wrap {{
-            width: var(--w);
           }}
           .label {{
             font-size: 14px;
@@ -171,7 +162,6 @@ def distance_wheel_picker(
             line-height: var(--h);
             text-align: center;
             font-size: 18px;
-            letter-spacing: 0.2px;
             scroll-snap-align: center;
             color: rgba(234,234,234,0.70);
             user-select: none;
@@ -210,20 +200,20 @@ def distance_wheel_picker(
         </style>
       </head>
       <body>
-        <div class="wrap">
+        <div>
           <div class="label">{label}</div>
           <div class="wheel">
             <div class="fade-top"></div>
             <div class="fade-bottom"></div>
             <div class="center-highlight"></div>
-            <div id="list" class="list">
+            <div id="{list_id}" class="list">
               {options_html}
             </div>
           </div>
         </div>
 
         <script>
-          const list = document.getElementById("list");
+          const list = document.getElementById("{list_id}");
           const rowH = parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--h'));
           const baseLen = {base_len};
           const initialIndex = {initial_index};
@@ -235,7 +225,6 @@ def distance_wheel_picker(
           }}
 
           function nearestIndex() {{
-            // scrollTop + center offset
             const center = list.scrollTop + (list.clientHeight / 2);
             const idx = Math.round((center - (rowH / 2)) / rowH);
             return Math.max(0, Math.min(idx, list.children.length - 1));
@@ -260,13 +249,9 @@ def distance_wheel_picker(
             const val = valueAtIndex(idx);
             if (val === null) return;
 
-            // snap to exact row
             const targetScroll = idx * rowH - (list.clientHeight/2 - rowH/2);
             list.scrollTo({{ top: targetScroll, behavior: "auto" }});
 
-            // wrap logic:
-            // if we are in first third -> jump to middle third
-            // if in last third -> jump to middle third
             let idxIn3 = idx;
             if (idxIn3 < baseLen) {{
               idxIn3 = idxIn3 + baseLen;
@@ -284,7 +269,6 @@ def distance_wheel_picker(
             sendValue(val2);
           }}
 
-          // initial positioning
           function init() {{
             const targetScroll = initialIndex * rowH - (list.clientHeight/2 - rowH/2);
             list.scrollTo({{ top: targetScroll, behavior: "auto" }});
@@ -298,7 +282,6 @@ def distance_wheel_picker(
             debounce = setTimeout(snapAndWrap, 140);
           }});
 
-          // click to select
           list.addEventListener("click", (e) => {{
             const item = e.target.closest(".item");
             if (!item) return;
@@ -315,6 +298,17 @@ def distance_wheel_picker(
       </body>
     </html>
     """
+
+    # IMPORTANT: no key= here (older Streamlit versions error)
+    picked = components.html(html, height=height_px + 40)
+
+    if picked is None:
+        return value
+    try:
+        return float(picked)
+    except Exception:
+        return value
+
 
     picked = components.html(html, height=height_px + 40, key=key)
     # Streamlit returns the JS value here
